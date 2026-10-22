@@ -1,6 +1,9 @@
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+
+from .contracts import MAX_FILE_BYTES, ContractExtraction, ExtractionError, extract_contract
 
 app = FastAPI(
     title="LCG Command Center API",
@@ -15,7 +18,7 @@ app.add_middleware(
         "http://127.0.0.1:5173",
     ],
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -26,3 +29,24 @@ async def health_check():
         "status": "ok",
         "service": "lcg-backend",
     }
+
+
+@app.post("/api/contracts/extract", response_model=ContractExtraction)
+async def extract_uploaded_contract(response: Response, file: UploadFile = File(...)):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        if not (file.filename or "").lower().endswith(".pdf") or file.content_type not in {"application/pdf", "application/octet-stream"}:
+            raise HTTPException(status_code=415, detail="Upload a PDF file (.pdf). Other file types are not supported.")
+        if file.size is not None and file.size > MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail="The PDF exceeds the 5 MB size limit.")
+        content = await file.read(MAX_FILE_BYTES + 1)
+        if len(content) > MAX_FILE_BYTES:
+            raise HTTPException(status_code=413, detail="The PDF exceeds the 5 MB size limit.")
+        if not content:
+            raise HTTPException(status_code=400, detail="The uploaded PDF is empty. Choose a non-empty PDF.")
+        try:
+            return await run_in_threadpool(extract_contract, content)
+        except ExtractionError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+    finally:
+        await file.close()

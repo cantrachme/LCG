@@ -1,15 +1,28 @@
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
 from .contracts import MAX_FILE_BYTES, ContractExtraction, ExtractionError, extract_contract
+from .browser import router as browser_router, session
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    async with session.lock:
+        await session.close()
 
 app = FastAPI(
     title="LCG Command Center API",
     description="Backend for the LCG AI Browser Agent",
     version="0.1.0",
+    lifespan=lifespan,
 )
+
+app.include_router(browser_router)
 
 app.add_middleware(
     CORSMiddleware,

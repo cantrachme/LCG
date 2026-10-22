@@ -1,8 +1,8 @@
 # LCG Command Center — Product Requirements Document (PRD)
 
-**Version:** 0.1 (initial draft)  
+**Version:** 0.2 (real LCW discovery and local session foundation)  
 **Date:** 2026-10-22  
-**Status:** Implementation baseline; subject to LCW access and stakeholder confirmation  
+**Status:** Read-only preproduction exploration verified; full contract workflow remains planned  
 **Primary persona:** School director / authorized admissions operator
 
 ## 1. Product summary
@@ -10,6 +10,14 @@
 **LCG Command Center** is a browser-based application with an **AI Coworker** panel and a **live, controlled LCW browser view**. An authorized user uploads a child-care subsidy contract and requests setup. The agent parses the document, verifies the existing child/family, prepares LCW changes, pauses for sensitive actions and confirms the saved result.
 
 This is a **contract-setup** initial release, not a general-purpose family-enrollment platform. The provided Camila PDF is a one-page non-production training contract; it does not supply all demographic or parent/guardian fields of a new admission application. The initial workflow must not invent those fields.
+
+### Current iteration and evidence
+
+The current iteration establishes a real, local LCW browser session using the existing FastAPI backend, React frontend and Python Playwright with headed Chromium. Exploration after login is read-only. Contract creation, field changes, submission and saving are outside this iteration. No mock portal, additional services, databases or agents are required.
+
+The application implements PDF extraction with source review, browser launch/sign-in controls, a same-page JPEG preview and local takeover controls. Source review is currently read-only; chat, field overrides, workflow orchestration, automatic child lookup and contract/PRA actions remain planned. The preview and takeover have not been verified end to end after authenticated login.
+
+On 2026-10-22, interactive Python Playwright exploration of actual LCW preproduction verified Microsoft sign-in with operator-completed MFA, authenticated navigation, Camila's child/family/center identifiers, an existing PRA assignment and an existing contract. These browser findings are discovery evidence, not completed application workflow steps. The original PDF and reference video were not available for fresh inspection in this iteration; their requirements are carried forward from the project brief and earlier documents. See [LCW browser discovery](LCW_BROWSER_DISCOVERY.md) for observed screens and selectors.
 
 ## 2. Main user experience
 
@@ -36,9 +44,13 @@ Desktop layout (responsive but desktop-first for this prototype):
 +----------------------------------+---------------------------------------+
 ```
 
-The live browser is a streamed **managed Chromium session**, not an iframe navigating directly to LCW. A secured viewer is proposed for a web deployment. The operator and agent must control **one authoritative browser session** rather than different copies of the website.
+The layout above describes the target experience. The current React workspace displays JPEG images from the exact page Playwright controls, refreshed approximately every 1.5 seconds. Sign-in and unrecognized pages suppress the preview. **Take control locally** pauses sign-in automation and focuses that same native Chromium window; the React image does not accept mouse or keyboard input. In-panel interaction and a secured hosted viewer are future work. The operator and agent must use **one authoritative browser session**.
+
+Reuse one dedicated local LCW profile across actions and application restarts. Repeated start requests must reuse the open page. Do not create extra browsers for testing or automatically retry credentials while MFA is pending. Closing the browser retains its profile and does not sign the operator out. Microsoft/LCW may still expire or revoke authentication; persistent sign-in must not be described as eliminating MFA. The new dedicated profile may require an initial sign-in when the operator is ready; authenticated reuse across restarts remains unverified. Further MFA testing is paused at the operator's request.
 
 ## 3. End-to-end user journey
+
+This is the target journey. Only the read-only foundation and discovery described above are delivered in this iteration; steps involving changes or saves require a later explicitly approved iteration.
 
 1. Open the Command Center, authenticate as an authorized operator, and create a run.
 2. Upload Camila's sample PDF; view file status and validation messages.
@@ -61,7 +73,7 @@ The live browser is a streamed **managed Chromium session**, not an iframe navig
 | FR-03 | P0 | Review and edit | Original and effective values visible; user-confirmed changes persisted with reason/source. |
 | FR-04 | P0 | Start/pause/resume run | State and current step clearly visible; no duplicate concurrent execution. |
 | FR-05 | P0 | Live browser view | Same browser page observed by agent is visible to director. |
-| FR-06 | P0 | Human authentication handoff | Pause at sign-in/MFA; no automation of authentication challenge or secret collection. |
+| FR-06 | P0 | Human authentication handoff | Use existing configured credentials only for observed sign-in steps; pause for manual MFA/unknown prompts. Do not automate challenges or collect secrets through chat. |
 | FR-07 | P0 | Verified family/child match | Require matching IDs/center or manual resolution before write. |
 | FR-08 | P0 | Contract mapping | Fill known LCW fields, verify field-level values, flag unmapped fields. |
 | FR-09 | P0 | Existing PRA awareness | Detect/reuse matching PRA; no blind duplicate creation. |
@@ -74,6 +86,7 @@ The live browser is a streamed **managed Chromium session**, not an iframe navig
 | FR-16 | P1 | Audit history | Store timestamped approvals/actions/results with redacted payloads. |
 | FR-17 | P1 | Reopen/resume interrupted run | Recover to a safe checkpoint; reconcile LCW state before retrying writes. |
 | FR-18 | P2 | Multi-operator concurrency | Isolated sessions per operator, subject to access and capacity testing. |
+| FR-19 | P0 | Reuse local authentication | Reuse the active session and fixed local profile; do not launch a fresh profile or trigger sign-in for each action/test. Pause when Microsoft/LCW requires renewed authentication. Cross-restart authenticated reuse must be verified before acceptance. |
 
 P0 = needed for an end-to-end controlled demonstration. The order of delivery follows the five modules, so P0 capabilities can be completed across modules.
 
@@ -105,6 +118,8 @@ stateDiagram-v2
 
 **Invariant:** no write while waiting for human input, user takeover, approval, or unresolved write status. A run can have multiple approval/verification cycles (contract and, if required, PRA).
 
+This state diagram is a future workflow model. The current browser API reports local session states such as `closed`, `waiting_for_login`, `waiting_for_mfa`, `waiting_for_user`, `authenticated`, `portal_unverified`, `navigation_error` and `unexpected_page`; it does not implement contract-run states or save approval.
+
 ## 6. Data model: minimum extracted contract fields
 
 - **Identity:** child full name, child ID, family name, family ID, center, LCW agency selection.
@@ -132,6 +147,14 @@ LCW-generated contract number must be obtained **after** confirmed save; do not 
 | Source and LCW values conflict | Show both and request confirmation; never silently overwrite. |
 | LCW navigation/layout changes | Prefer semantic selectors; fail with actionable evidence if safe mapping impossible. |
 
+### Observed Camila records — 2026-10-22
+
+- Child detail confirmed Camila Barajas, child ID **1155030**, family ID **870985**, Family Center **0265-CA Jurupa Ave**.
+- Program/Room Assignment showed an existing active School Age 2 assignment for **2026-08-08 to 2026-11-20**, matching the sample's existing-PRA period. Full schedule/rate compatibility has not been verified.
+- The Third Party Contract List already showed **CA - ST Riverside County Office of Ed**, **2026-09-28 to 2026-10-02**, existing contract ID **1833773**. Its fields, unit prices and copays were not inspected. Reconcile this existing record before proposing creation.
+
+The sample requires reuse of an existing PRA, while the video creates a new one. Actual LCW state governs the proposed branch. Any action that could duplicate a PRA or modify saved data requires explicit approval. No add/edit/copy/save action was performed in discovery.
+
 ## 8. Nonfunctional requirements
 
 - **Security:** authentication and authorization; tenant/operator isolation; allowlisted LCW origin; one writer per browser session; TLS and encrypted secrets; protect child/family information.
@@ -153,7 +176,10 @@ LCW-generated contract number must be obtained **after** confirmed save; do not 
 - [ ] Approval is required before each consequential save.
 - [ ] Saved contract is verified and recorded, or the result is visibly unresolved.
 - [ ] Browser/site/session errors are recoverable or clearly actionable.
-- [ ] End-to-end mock portal test passes before preproduction integration.
+- [ ] Authorized real LCW read-only navigation can be reproduced through application actions, with evidence and no record changes.
+- [ ] Reopening the dedicated local profile reuses authentication when Microsoft/LCW permits it; no extra test browser prompts for MFA.
+
+These are release acceptance checks, not a statement that the full workflow has passed. Real interactive read-only discovery succeeded; integrated post-MFA preview/takeover and cross-restart authenticated reuse remain pending. The existing 33 backend tests, frontend build and lint passed; they do not establish end-to-end LCW workflow completion.
 
 ## 10. Release and dependency plan
 
@@ -165,7 +191,7 @@ LCW-generated contract number must be obtained **after** confirmed save; do not 
 | 4. Browser | Live browser, authorized LCW interaction, manual takeover and verification. |
 | 5. Deployment | Security/test hardening, containerization, Azure deployment and runbook. |
 
-**Not yet verified:** LCW selectors, endpoints, exact login method, ability to read preproduction records, rate rules, and deployment/security approvals. Implementation should use a local mock portal until these are available.
+**Verified:** actual preproduction launch, Microsoft login with manual MFA, authenticated read-only navigation, identity match, existing PRA assignment and contract list. **Not yet verified:** full field mapping, rates/copays, integrated post-MFA preview/takeover, authenticated reuse across restarts, save behavior and deployment/security approvals. Establish reliable local execution before adding remote-browser infrastructure. This iteration must not install dependencies, create environment files or execute Git operations.
 
 ---
 

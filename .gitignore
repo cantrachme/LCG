@@ -27,3 +27,6 @@ build/
 
 # Temporary files
 *.tmp
+
+# Dedicated LCW browser profile contains authentication state and private page data
+backend/.lcw-browser-profile/

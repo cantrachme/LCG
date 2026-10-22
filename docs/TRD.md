@@ -1,21 +1,42 @@
 # LCG Command Center — Technical Requirements Document (TRD)
 
-**Version:** 0.1 (initial design)  
+**Version:** 0.2 (local browser implementation and verified LCW discovery)  
 **Date:** 2026-10-22  
-**Status:** Engineering proposal; critical assumptions marked  
-**Deployment target:** Azure (after local and mock-environment validation)
+**Status:** Local read-only foundation implemented; authenticated integration checks partly pending  
+**Current runtime:** Local React + FastAPI + headed Chromium; Azure is future work
 
 ## 1. Engineering decision summary
 
-**Recommended stack:** React + TypeScript + Vite (UI); FastAPI + Pydantic (Python API); Playwright Python (browser adapter); LangGraph (stateful workflow with human interruptions); PyMuPDF (digital PDF text); Azure OpenAI (optional structured extraction assistance and controlled intent parsing); PostgreSQL (durable run/approval state); Chromium in an isolated session; noVNC plus authenticated gateway for displaying the **same** controlled browser in the web application; Docker / Azure Container Apps for cloud hosting.
+**Implemented stack:** existing React + TypeScript + Vite frontend; FastAPI + Pydantic backend; PyMuPDF extraction of labeled digital PDFs; Python Playwright with local headed Chromium. A single in-process session and lock are sufficient for the current single-operator read-only scope. Configuration is read from the existing `backend/.env`.
+
+**Deferred options:** LangGraph, Azure OpenAI, PostgreSQL, document storage, Docker/Azure deployment and remote-browser/viewer services. These are not required by this iteration and must not be introduced before reliable local execution. No new dependencies, environment files, agents, services or databases were added; no Git operations were executed.
 
 **Why FastAPI instead of Django?** This project centers on asynchronous I/O, browser actions, real-time events and AI orchestration rather than built-in administrative models. FastAPI has straightforward REST and WebSocket support; Django would be reasonable if built-in admin/ORM were dominant requirements. This is a fit decision, not a claim that Django cannot perform the work.
 
-**Why web first, not Electron?** The brief allows a web or desktop app and asks for Azure deployment. Web + remote controlled Chromium produces a shareable cloud-based Command Center. A normal iframe may be disallowed by LCW and cannot grant arbitrary cross-origin automation. Electron's `WebContentsView` is a viable alternative for a desktop-specific product but creates a separate desktop packaging and Azure-backend deployment architecture; it is not our initial build.
+**Browser display decision:** React displays JPEG frames captured from the exact page Playwright controls. Local native Chromium remains the interaction surface for manual control. In-panel input and hosted browser infrastructure are deferred. A separate LCW iframe or unrelated browser session cannot satisfy the same-session requirement.
 
 **Why hybrid agent, not unconstrained vision clicks?** Contract values, identity matching and saving are high-consequence operations. Use deterministic field mappings, validation and fixed browser tools first; the LLM handles conversational intent and assistance with ambiguous content only, never direct uncontrolled JS or unapproved writes.
 
 ## 2. Reference architecture
+
+### Current local implementation
+
+```mermaid
+flowchart LR
+  OP[Local operator] --> UI[React Command Center]
+  UI <-->|REST status and JPEG frames| API[Existing FastAPI server]
+  API --> PARSER[PyMuPDF extraction]
+  API --> BA[Python Playwright session and lock]
+  BA --> CHR[Headed Chromium and dedicated local profile]
+  OP -->|Manual MFA and local takeover| CHR
+  CHR --> LCW[Actual LCW preproduction]
+```
+
+One backend worker, one dedicated profile, one controlled page. The existing extraction endpoint processes uploads in memory; no database or workflow runner is involved. Native operator input is outside the API lock, so the application cannot prevent manual LCW edits in that window; implemented agent actions remain read-only after sign-in.
+
+### Future hosted architecture — proposal only
+
+The following topology is retained for later deployment planning. It is not the current implementation or a requirement for local discovery.
 
 ```mermaid
 flowchart LR
@@ -35,7 +56,15 @@ flowchart LR
 
 **Single session invariant:** viewer and Playwright must target the same browser desktop/profile. Agent actions and direct human control are mutually exclusive and governed by a server-side lease/lock. An image of a separate browser is not a valid solution.
 
-### Browser viewer design (proposed)
+### Current preview and future takeover
+
+The browser workspace fetches a `page.screenshot(type='jpeg')` frame approximately every 1.5 seconds while visible. Frames are returned with `Cache-Control: no-store` and are not written to disk. Microsoft sign-in and unrecognized pages suppress the preview. This is a low-frame-rate page preview; it does not include browser chrome or accept React mouse/key input. Post-MFA preview integration has not been verified.
+
+**Take control locally** sets human ownership under the shared lock and brings the controlled page forward. Sign-in automation refuses to act while human ownership is active. **Return control** re-observes the page; MFA forces human ownership again. Native-window takeover is implemented; authenticated end-to-end verification remains pending.
+
+For future in-panel interaction, investigate Chromium CDP `Page.startScreencast`, frame acknowledgments and validated mouse/key events targeting the same page. Add a server-held human-control lease, coordinate scaling, session binding and re-observation before agent dispatch resumes. Do not expose debugging ports or arbitrary CDP commands. This is an investigation, not implemented functionality.
+
+### Remote viewer option — deferred
 
 - On a Linux worker start virtual display (Xvfb), Chromium in headed mode, a protected VNC service and WebSocket gateway (e.g. websockify + noVNC). Playwright controls the Chromium instance on that display.
 - Serve the VNC viewer behind authenticated, run-scoped, short-lived access. VNC service and debugging ports must **not** be publicly exposed.
@@ -43,7 +72,7 @@ flowchart LR
 - POC: one active operator/browser at a time is acceptable only if explicitly labeled. Multi-user version: one isolated browser session per operator/run plus session routing and resource limits.
 - Validate browser viewer with a real interactive prototype early in Module 4; this is an integration risk, not a proven feature yet.
 
-## 3. Proposed repository structure (created manually during Module 2)
+## 3. Current repository structure
 
 ```text
 LCG/
@@ -51,32 +80,30 @@ LCG/
     PRD.md
     BRD.md
     TRD.md
+    LCW_BROWSER_DISCOVERY.md
   frontend/
     src/
-      components/
-      features/{chat,documents,workflow,browser}/
-      services/
+      App.tsx
+      BrowserWorkspace.tsx
+      App.css
+      index.css
+      main.tsx
   backend/
     app/
-      api/
-      core/
-      models/
-      schemas/
-      services/{documents,workflow,chat}/
-      agent/{graph,nodes,policies}/
-      browser/{interface,playwright,lcw_adapter}/
-      repositories/
+      main.py
+      contracts.py
+      browser.py
     tests/
-  mock-lcw/
-  infra/
-    docker/
-    azure/
-  .gitignore                  # Manually created in Module 2
-  .env.example               # Template created in Module 2; never secrets
-  README.md
+      test_health.py
+      test_contracts.py
+      test_browser.py
+    requirements.txt
+    .env                      # Existing operator-managed configuration; ignored
+    .lcw-browser-profile/     # Created on first dedicated-profile launch; ignored
+  .gitignore
 ```
 
-No Git repository, virtual environment, dependencies, `.env` or application code is created in Module 1. The folder above is **planned**, not asserted to exist. The existing local `LCG` folder belongs to the operator.
+Only essential browser implementation, UI, tests and discovery documentation were added to the existing app. The profile directory is runtime data, not source code. There is no mock LCW application or new infrastructure layer.
 
 ## 4. Implementation modules and exit criteria
 
@@ -86,27 +113,27 @@ No Git repository, virtual environment, dependencies, `.env` or application code
 - Capture user workflow and demo/PDF differences; choose baseline stack; document Azure topology, risk and required permissions.
 - **Exit:** internally consistent docs and explicit unresolved decisions; no application setup needed.
 
-### Module 2 — Local foundation and Command Center
+### Module 2 — Existing local foundation
 
-- Manually create Python 3.11+ virtual environment and Vite React TypeScript project in existing `LCG` directory.
-- Manually install pinned Python/npm packages and Chromium browser binaries; manually create `.env` from safe `.env.example` and `.gitignore`.
-- Implement FastAPI routes for health, upload metadata, run creation and event streaming; React split-pane shell (AI coworker + browser placeholder).
-- Start a small local mock LCW portal for integration tests (may begin with login/child detail stub).
-- **Exit:** local frontend and backend run, API health passes, sample file can be uploaded, UI sees backend run status.
+- React, FastAPI, the virtual environment, dependencies, Chromium and `backend/.env` already existed when browser work began; reuse them.
+- Health and PDF extraction routes plus the split-pane UI are present. Run creation and event streaming remain future features.
+- **Current boundary:** do not install dependencies, create environment files or execute Git operations.
 
 ### Module 3 — Parsing, controlled chat and workflow
 
 - Extract digital PDF text with PyMuPDF. If scanned input is needed later, evaluate OCR/document intelligence; do not guess OCR output.
+- **Implemented:** deterministic labeled-contract extraction with source/normalized values, missing/review statuses, upload validation and read-only React review. The original Camila PDF was not available for a fresh extraction check during this browser iteration.
 - Define typed `ContractData`, `Provenance`, `Override`, `PRAData` schemas, required/optional fields and validation (dates, weekly hours, currencies, IDs).
-- Introduce LangGraph workflow with persisted checkpoints, manual corrections, structured chat commands, limited LLM tools and approvals.
-- **Exit:** deterministic Camila fixture matches extracted fields; date-override audit trail; missing/contradictory input pauses correctly; mock planner executes without LCW.
+- **Future work:** evaluate workflow orchestration, persisted checkpoints, manual corrections, structured chat commands and approval handling when required by the next iteration.
+- **Future exit:** validated source extraction, date-override audit trail, missing/contradictory input pauses and offline workflow checks. No additional mock portal or service is required by the current scope.
 
-### Module 4 — Browser agent and LCW adapter
+### Module 4 — Current browser foundation and future workflow
 
-- Build Playwright browser/session manager with secure configuration; mock LCW pages exercise navigation, identification, fill, review and save.
-- Add LCW page-object/adapter mapping using semantic locators and controlled fallbacks. Inspect authorized real LCW screens **only after access is granted**.
-- Implement browser viewer and takeover; login/MFA pause; per-action validation; existing-PRA detection; human approval; read-after-write verification; safe recovery.
-- **Exit:** end-to-end demo on mock LCW with no duplicate PRA; optionally real authorized preproduction integration if access is available.
+- **Implemented:** local session manager, observed Microsoft sign-in steps, manual MFA pause, same-page JPEG preview, local ownership controls, sanitized errors and fixed profile reuse.
+- **Verified interactively on real preproduction:** headed launch, login with manual MFA, home/search navigation, child/family/center identity, existing assignment/PRA row and contract list. No record writes.
+- **Pending:** authenticated preview/takeover integration and authenticated reuse after restart. Further MFA testing was declined by the operator; do not launch extra test browsers.
+- **Later iteration:** expose validated read-only child/record inspection as application actions before adding field entry, approval gates or save verification. No add/edit/copy/save action is permitted in this iteration.
+- **Exit for current scope:** document actual observations and boundaries; pass offline checks. This does not imply the full contract workflow has passed.
 
 ### Module 5 — Security, testing and Azure
 
@@ -115,11 +142,25 @@ No Git repository, virtual environment, dependencies, `.env` or application code
 - Test authentication, web sockets/viewer, browser worker lifecycle, approval gates and failure handling in target environment.
 - **Exit:** deployable and tested cloud solution; access-dependent LCW limitations clearly documented.
 
-After each module: run documented verification commands, review diff, **manually** `git add`, `git commit` and `git push` when the repository/remote has been created by the operator. No automatic GitHub initialization/push.
+Current constraints: keep the implementation minimal; reuse the existing app; no dependency installation, new environment files, Git operations, additional agents, databases or infrastructure. Cloud work is deferred.
 
 ## 5. Browser-agent tool contract
 
-Expose narrow, observable functions (rather than unrestricted page scripting):
+### Implemented session behavior
+
+- Read `LCW_URL`, `LCW_USERNAME`, `LCW_PASSWORD` from existing `backend/.env`; never hardcode or log credentials. The URL must be HTTPS without embedded credentials, query or fragment.
+- Launch with `chromium.launch_persistent_context`, `headless=False`, using fixed `backend/.lcw-browser-profile/`. Create the profile with owner-only permissions and exclude it from version control. It contains sensitive auth/browser data; do not share it.
+- Reuse the active context/page without navigating away on repeated starts. Reopen the same profile after a graceful close/restart. If another process owns the profile, report failure; do not silently create a fresh profile.
+- Initial dedicated-profile sign-in may still be required. Existing session cookies and Microsoft/LCW policy determine later authentication. Closing the browser retains its profile; it does not sign out. Cross-restart authenticated reuse is untested.
+- One backend worker without reload; serialize browser access through one `asyncio.Lock`. No extra authenticated test sessions and no automatic credential retries while MFA is pending.
+- Login uses observed `#i0116` / `Next`, `#i0118` / `Sign in`; password submission is limited to one attempt per launched session. The observed `Approve sign in request` heading pauses for the operator. Other prompts, including `Stay signed in?`, remain manual.
+- Recognize authenticated LCW using the configured origin plus observed `#userProfileMenu` and navigation link `Family`. Authentication does not verify a child record.
+- Navigation errors/timeouts, closed pages, unfamiliar pages and return to Microsoft sign-in are surfaced with fixed messages. No raw exception text, URL queries, cookies, tokens or DOM are returned by the session API. Automated recovery of arbitrary portal/session-expiry screens is not verified.
+- Current states: `closed`, `waiting_for_login`, `waiting_for_mfa`, `waiting_for_user`, `portal_unverified`, `authenticated`, `navigation_error`, `unexpected_page`.
+
+### Future workflow tools — not implemented
+
+Expose narrow, observable functions when the workflow is implemented:
 
 ```text
 open_portal(run_id)
@@ -167,9 +208,30 @@ flowchart TD
 
 **Important:** The sample PDF says reuse a PRA for 2026-08-08 to 2026-11-20; the video includes an example approved contract extension to 2027-02-10. That extension may exceed PRA coverage; do not automatically proceed to a conflicting save. Ask the operator to resolve the business rule and LCW state.
 
+Actual discovery found an existing assignment for that PRA period and an existing matching agency/date contract. Inspect and reconcile them before entering this future write workflow. Any action that may duplicate a PRA or modify saved data requires explicit approval.
+
 LLM responses are **proposals**: schema-validate every value, cross-check against original PDF and portal, and require human review for unsupported claims. Never let the LLM assert a save succeeded without LCW evidence.
 
-## 7. API contract (proposed, not yet implemented)
+## 7. API contract
+
+### Current routes
+
+| Method | Route | Behavior |
+|---|---|---|
+| GET | `/api/health` | Backend health |
+| POST | `/api/contracts/extract` | In-memory PDF extraction; 5 MB / 10 page limits; source-aware result |
+| POST | `/api/browser/start` | Open/reuse dedicated local headed Chromium context/page |
+| POST | `/api/browser/login` | Observed credential steps only; pause for manual challenges |
+| POST | `/api/browser/take-control` | Set human ownership and focus the controlled page |
+| POST | `/api/browser/return-control` | Set agent ownership, then re-observe; MFA retains human ownership |
+| POST | `/api/browser/close` | Graceful close; retain local profile |
+| GET | `/api/browser/status` | Session state, ownership and origin; no URL query |
+| GET | `/api/browser/frame` | Actual controlled-page JPEG; no-store; suppressed during sign-in/unrecognized pages |
+| GET | `/api/browser/navigation` | Visible link labels only; no clicks or record verification |
+
+Browser routes require a loopback client/host, `X-LCG-Local: 1`, and an allowed frontend Origin when supplied (`http://localhost:5173` or `http://127.0.0.1:5173`). This local request guard is not a production operator-authentication system. No generic URL/click/script/input, record-edit or save routes exist.
+
+### Future versioned workflow API — proposal only
 
 | Method | Route | Purpose |
 |---|---|---|
@@ -187,11 +249,11 @@ LLM responses are **proposals**: schema-validate every value, cross-check agains
 | GET | `/api/v1/runs/{id}/viewer-token` | short-lived scoped viewer access |
 | WS | `/api/v1/runs/{id}/events` | step updates, failures and prompts |
 
-Every authenticated route enforces operator scope; write APIs check CSRF/origin protections as appropriate to the chosen auth model, state version/idempotency key and server-side authorization. Viewer access token must not act as an API bearer credential.
+For the future versioned API, every authenticated route must enforce operator scope; write APIs check CSRF/origin protections as appropriate to the chosen auth model, state version/idempotency key and server-side authorization. Viewer access token must not act as an API bearer credential.
 
 ## 8. Storage and consistency
 
-Proposed PostgreSQL entities:
+The current app has no database. It retains browser authentication data only in the dedicated local profile; uploaded PDFs and preview frames are not saved by the application. Browser profile/cache contents remain sensitive runtime data. The following PostgreSQL entities are future proposals:
 
 - `users` / `operator_roles`: principal identifier, permissions.
 - `documents`: upload metadata, blob object reference, classification, retention/deletion status.
@@ -205,7 +267,7 @@ Proposed PostgreSQL entities:
 
 Contract data should have encryption-at-rest and application access controls; use opaque references in logs. Files/screenshots/traces may contain sensitive information: restrict, encrypt, minimize, auto-expire. Workflow state must survive an API restart, but a Chromium tab itself is not durable; after a worker crash, reauthenticate if needed and re-observe LCW before any write.
 
-## 9. Azure deployment plan
+## 9. Future Azure deployment plan — deferred
 
 ### Prototype deployment
 
@@ -242,71 +304,88 @@ Azure OpenAI / Key Vault / Azure Monitor
 5. Health probes, resource constraints, startup delays, secret access and application logging work in the target tenant.
 6. Browser viewer traffic is encrypted and authenticated; VNC and CDP ports remain internal.
 
-## 10. Testing strategy
+## 10. Future workflow testing strategy
 
 | Test layer | Scope |
 |---|---|
 | Unit | extraction parser, field validators, schema serialization, approval token verification |
 | Agent state | LangGraph transitions, interrupt/resume, conflict handling, run version checks |
-| Browser integration | mock LCW site selectors, login-pause, child ID matching, existing-PRA branch, save verification |
+| Browser integration | observed real LCW selectors, login pause, child ID matching and existing-PRA inspection; write/save checks only in a separately authorized scope |
 | Negative tests | wrong child/family, duplicate contract, conflicting dates, altered rates, timeout after save |
 | Human takeover | agent stops on takeover; resumes only after release + page observation |
-| End-to-end | PDF → corrected data → mock LCW → reviewed save → verified confirmation |
+| End-to-end | PDF → verified existing LCW records → approved changes → saved-state verification, only after separate authorization for writes |
 | Azure smoke | frontend/API, session stream, preproduction connectivity, restricted secrets/logs |
 
-Store synthetic fixtures in the repository. **Do not commit live auth cookies, LCW credentials, real children's data, trace archives or video recordings with personal information.** Playwright auth storage is sensitive and should be in `.gitignore` if ever used locally.
+Store synthetic fixtures in the repository. **Do not commit live auth cookies, LCW credentials, real children's data, trace archives or video recordings with personal information.** The dedicated local profile is sensitive and is already excluded by `.gitignore`; do not commit or share it.
 
-## 11. Manual local setup policy (Module 2, not executed yet)
+## 11. Local operation and verification policy
 
-When Module 2 starts, the operator will run commands manually from the existing `LCG` directory, including:
-
-```bash
-# Preview only — execute manually during Module 2
-python3 --version
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-# Create backend requirements/pyproject and install pinned dependencies after review.
-# Create frontend via npm and install dependencies after review.
-# Install Playwright Chromium via the documented installer after review.
-# Manually create local .env; never put secrets in Git.
-```
-
-Likewise, repository creation, remote configuration and each commit/push are operator-driven. Illustrative commands **after** GitHub repository creation:
+Use the existing runtime and dependencies. Do not install packages, create environment files or execute Git operations in this iteration. Start one backend worker without reload:
 
 ```bash
-# Manually, from LCG/; do not run before inspecting and adding .gitignore
-# git init
-# git branch -M main
-# git remote add origin <your-github-repo-url>
-# git add docs/PRD.md docs/BRD.md docs/TRD.md
-# git commit -m "docs: define LCG command center requirements and architecture"
-# git push -u origin main
+.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log
 ```
 
-No commands above have been executed by this document.
+The existing frontend uses `npm run dev` from `frontend/`. Starting the API/UI does not itself open Chromium or trigger sign-in. **Open LCW** uses the dedicated profile when the operator is ready. Do not start additional backends/browsers to validate login. The earlier authenticated temporary discovery context cannot be retroactively converted into the new dedicated profile.
 
-## 12. Decisions and discovery checklist
+Offline verification commands, from the indicated project directory:
 
-**Chosen for now:** web Command Center; FastAPI; Python Playwright; LangGraph; PostgreSQL; containerized isolated Chromium; Azure Container Apps; human approval for writes; source-preserving extraction.
+```bash
+# Repository root
+PYTHONPATH=backend .venv/bin/python -m pytest backend/tests -q
 
-**To validate before or during Modules 2–4:**
+# frontend/
+npm run build
+npm run lint
+```
 
-- Exact LCW test URL, environment, automation authorization and account access.
-- Screen-by-screen mapping and whether LCW itself creates a PRA or links an existing one.
-- Whether contract writes can be staged without saving; source-of-truth for rates and policy.
-- Azure tenant access, required deployment region, corporate SSO and retention/security requirements.
-- Browser viewer performance/security with noVNC in actual hosting environment.
-- Rate and contract date conflicts between video and supplied sample.
-- Whether system should persist uploaded training documents beyond a run.
+On 2026-10-22 all **33 backend tests**, frontend production build and lint passed. Backend tests use synthetic data/mocked browser objects and do not contact LCW or trigger MFA. They cover extraction/health, local route restrictions, rejection of record writes, active-page reuse, a stable persistent-profile path, manual-control blocking, prevention of password retries, redaction and timeout handling. Existing PyMuPDF SWIG deprecation warnings were emitted.
 
-**Not acceptable:** inventing missing LCW endpoints, bypassing MFA, interpreting fictional subsidy terms as real government rules, declaring success without saved-state verification, or silently submitting a duplicate contract/PRA.
+Real integrated FastAPI launch/login reached MFA. Post-MFA preview/takeover and cross-restart authenticated profile reuse remain pending because the operator declined another MFA test. No new login is requested for validation now. The broader testing matrix in section 10 describes later workflow/deployment checks, not completed tests.
+
+## 12. Verified discovery and unresolved decisions
+
+### Actual LCW navigation — 2026-10-22
+
+Target: `https://lcw2-preprod.learningcaregroup.com/center/daycare.do`, read from `backend/.env`. Interactive Python Playwright completed the credential flow, paused for operator-completed MFA, then reached the authenticated portal. In that temporary discovery session, **No** was selected at **Stay signed in?**; the permanent-profile implementation leaves this choice to the operator.
+
+| Screen / step | Observed selector or route | Outcome |
+|---|---|---|
+| Microsoft username/password | `#i0116`, button `Next`; `#i0118`, button `Sign in` | Credentials submitted from configuration; MFA remained manual |
+| LCW home | `/center/daycare.do`, `#userProfileMenu`, navigation link `Family` | Authenticated; selected center 0265-CA Jurupa Ave |
+| Family lookup | Search-icon link accessible name `\uf002`, then button `A - B` | Alphabetical family results reached |
+| Child result | `a[href="cgchild.do?child_id=1155030"]` | Camila detail opened at `/center/cgchild.do` |
+| Identity | Child detail header/admission text | Child ID 1155030; family ID 870985; Family Center 0265-CA Jurupa Ave |
+| Existing PRA | Tab `Program/Room Assignment` | Active School Age 2 assignment 08/08/2026–11/20/2026; displayed rate SU County EE School Age-B/A ($170.00) |
+| Contract navigation | Tab `Third Party`, `/center/familyThirdParty.do`, observed `javascript:viewContracts(1155030,'Barajas, Camila')` link | Existing third-party contract list read |
+| Existing contract | List row; existing `editContract(1833773)` link was observed, not clicked | CA - ST Riverside County Office of Ed; 09/28/2026–10/02/2026; ID 1833773 |
+
+Dynamic `sm-…` menu IDs changed and must not be hardcoded. A CSS text selector for the search icon timed out; its accessible-role selector worked. Clicking the top Search textbox alone did not load results. Text search, Advanced Search, full search-result URL parameters, full PRA details, contract fields, unit prices/copays and save behavior were not tested. No selectors for those untested workflows may be treated as verified.
+
+No LCW record was created, modified, submitted or saved. Child/family/PRA/contract inspection above is interactive discovery evidence; these are not automatic application actions yet. Detailed observations and limitations are in [LCW browser discovery](LCW_BROWSER_DISCOVERY.md).
+
+**Current decisions:** existing React/FastAPI/PyMuPDF, local Python Playwright, one dedicated persistent profile, actual preproduction, read-only agent actions after login, same-page preview and local human control. Extra services, agents, databases and remote-browser infrastructure are deferred.
+
+**Still to validate:**
+
+- Authenticated preview/takeover integration and profile reuse after restart, when the operator is ready; no additional MFA tests now.
+- Reproducible read-only child/record application actions using observed navigation and all identifiers.
+- Full contract field map, PRA schedule/rate compatibility and reconciliation of existing contract 1833773 before any future write.
+- Approval binding, duplicate prevention and saved-state verification in a separately authorized iteration.
+- Future operator authentication, profile retention/deletion, tenant isolation and deployment/security requirements.
+- Azure region/access, cloud session continuity and viewer performance only when hosted deployment is requested.
+
+**Not acceptable:** invented selectors or tested-workflow claims, bypassed MFA, repeated fresh test browsers, unapproved changes to saved LCW data, duplicate PRA creation or interpreting fictional training rates as official policy.
 
 ## 13. Research references (official documentation, accessed 2026-10-22)
 
 - FastAPI WebSockets: https://fastapi.tiangolo.com/advanced/websockets/
 - Playwright Python Docker/browser dependencies: https://playwright.dev/python/docs/docker
 - Playwright auth-state sensitivity: https://playwright.dev/python/docs/auth
+- Playwright persistent context: https://playwright.dev/python/docs/api/class-browsertype#browser-type-launch-persistent-context
+- Playwright screenshots: https://playwright.dev/python/docs/api/class-page#page-screenshot
+- Playwright CDP sessions: https://playwright.dev/python/docs/api/class-cdpsession
+- Microsoft session lifetime: https://learn.microsoft.com/en-us/entra/identity/conditional-access/concept-session-lifetime
 - Playwright trace viewer: https://playwright.dev/python/docs/trace-viewer
 - noVNC project: https://github.com/novnc/noVNC
 - Electron external-content embedding and `WebContentsView` alternative: https://www.electronjs.org/docs/latest/tutorial/web-embeds
@@ -319,4 +398,4 @@ No commands above have been executed by this document.
 
 ---
 
-**Evidence boundary:** LCW access has not been provided or tested. Exact target UI behavior remains an implementation-time discovery task; this document specifies a defensible engineering approach rather than pretending it is already verified.
+**Evidence boundary:** actual LCW read-only access, identity and existing-record discovery were verified on 2026-10-22. Integrated authenticated preview/takeover, cross-restart authentication reuse, full field mapping and writes remain unverified. Original PDF/video facts are carried forward from earlier project context; those original attachments were not freshly inspected in this iteration. No end-to-end contract-creation success is claimed.

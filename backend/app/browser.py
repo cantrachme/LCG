@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeout, async_playwright
 
 from .contracts import ContractExtraction
+from . import database
 from .inspection import (InspectionError, build_result, child_links, expected_identity, normalized,
                          parse_contract_rows, parse_pra_rows, search_group, verify_family_header, verify_identity)
 
@@ -102,7 +103,7 @@ class LCWSession:
         self.document_id = None
 
     def set_document(self, document):
-        self.document_id = str(uuid4())
+        self.document_id = document.extraction_id or str(uuid4())
         self.document = document.model_copy(deep=True, update={'extraction_id': self.document_id})
         return self.document
 
@@ -520,6 +521,15 @@ class LCWSession:
         self.job['events'].append({'stage': stage, 'state': state, 'at': datetime.now(timezone.utc).isoformat()})
         self.job['events'] = self.job['events'][-30:]
         self.message = stage
+        if database.configured():
+            try:
+                database.save_workflow(self.job)
+            except HTTPException:
+                self.owner = 'human'
+                self.epoch += 1
+                self.resume.clear()
+                self.job['state'] = 'failed'
+                self.message = self.job['stage'] = 'Workflow stopped because its state could not be persisted. Restore database access before retrying.'
 
     async def step(self, stage, operation, epoch):
         if self.owner != 'agent' or epoch != self.epoch:
@@ -535,6 +545,8 @@ class LCWSession:
                 if self.owner != 'agent' or epoch != self.epoch:
                     raise Paused()
                 self.progress(stage)
+                if self.owner != 'agent':
+                    raise Paused()
                 value = await asyncio.wait_for(operation(), timeout=12)
                 # Ownership may have changed while the single bounded operation awaited.
                 if self.owner != 'agent' or epoch != self.epoch:
@@ -565,6 +577,12 @@ class LCWSession:
             self.job = {'id': str(uuid4()), 'request_id': request.request_id, 'extraction_id': self.document_id,
                         'state': 'inspecting', 'stage': 'Inspection requested', 'version': 0, 'events': [],
                         'source': self.document.model_copy(deep=True), 'result': None}
+            if database.configured():
+                try:
+                    database.save_workflow(self.job)
+                except HTTPException:
+                    self.job = None
+                    raise
             self.resume.set()
             self.task = asyncio.create_task(self.run_inspection())
             return self.result()
@@ -729,6 +747,7 @@ class LCWSession:
         if self.task and not self.task.done():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
+        if self.job:
             self.progress('Inspection stopped by the operator. Session and PDF are retained; return control before starting a new inspection.', 'cancelled')
         return self.result()
 

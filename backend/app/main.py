@@ -89,3 +89,13 @@ async def extract_uploaded_contract(response: Response, file: UploadFile = File(
             raise HTTPException(status_code=422, detail=str(error)) from None
     finally:
         await file.close()
+
+
+@app.post('/api/contracts/{identifier}/select', response_model=ContractExtraction, dependencies=[Depends(local_request)])
+async def select_saved_contract(identifier: UUID, response: Response):
+    """Select saved extraction for the existing inspection UI; never operates Chromium."""
+    response.headers['Cache-Control'] = 'no-store'
+    saved = await run_in_threadpool(database.read, 'documents', identifier)
+    if session.task and not session.task.done() and session.document_id != str(identifier):
+        raise HTTPException(409, 'Stop the current inspection before selecting another document.')
+    return session.set_document(ContractExtraction.model_validate(saved['extraction']))

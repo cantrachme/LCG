@@ -208,6 +208,10 @@ def persistence_router(local_guard):
     def messages(identifier: UUID, limit: int = 50, offset: int = 0):
         return listing('messages', limit, offset, 'conversation_id', identifier)
 
+    @router.get('/conversations/{identifier}/documents')
+    def conversation_documents(identifier: UUID, limit: int = 50, offset: int = 0):
+        return listing('documents', limit, offset, 'conversation_id', identifier)
+
     @router.get('/documents')
     def documents(limit: int = 50, offset: int = 0):
         return listing('documents', limit, offset)

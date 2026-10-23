@@ -3,8 +3,6 @@ import type { FormEvent } from 'react'
 import './App.css'
 import BrowserWorkspace from './BrowserWorkspace'
 
-const healthUrl = 'http://127.0.0.1:8000/api/health'
-type ConnectionStatus = 'loading' | 'connected' | 'error'
 type FieldValue = string | number | boolean | null | string[] | { [key: string]: FieldValue }
 type ExtractedField = {
   original: string | null
@@ -43,253 +41,218 @@ function displayValue(value: FieldValue): string {
   return String(value)
 }
 
-function App() {
-  const [connection, setConnection] = useState<ConnectionStatus>('loading')
-  const [checkAttempt, setCheckAttempt] = useState(0)
-  const [selectedFile, setSelectedFile] = useState<File | null>(null)
-  const [uploading, setUploading] = useState(false)
-  const [uploadError, setUploadError] = useState<string | null>(null)
-  const [extraction, setExtraction] = useState<ContractExtraction | null>(null)
-  const uploadController = useRef<AbortController | null>(null)
+type Conversation = { id: string; title: string; created_at: string }
+type Message = { id: string; role: string; content: string; created_at: string }
+type DocumentRecord = { id: string; conversation_id: string; extraction: ContractExtraction; metadata: { filename: string }; created_at: string }
+const api = 'http://127.0.0.1:8000/api'
+const ignoreBrowserRestore = () => {} // Chat selection owns its document, not the last global browser job.
+const timestamp = (value: string) => new Date(value).toLocaleString()
 
-  useEffect(() => () => uploadController.current?.abort(), [])
-
-  async function uploadContract(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-    if (!selectedFile || uploading) return
-    setUploading(true)
-    setUploadError(null)
-    setExtraction(null)
-    const controller = new AbortController()
-    uploadController.current = controller
-    const timeout = window.setTimeout(() => controller.abort(), 30000)
-    const form = new FormData()
-    form.append('file', selectedFile)
-    try {
-      const response = await fetch('http://127.0.0.1:8000/api/contracts/extract', {
-        method: 'POST', headers: { 'X-LCG-Local': '1' }, body: form, signal: controller.signal,
-      })
-      if (!response.ok) {
-        const error = await response.json().catch(() => null)
-        throw new Error(typeof error?.detail === 'string' ? error.detail : `Extraction failed (${response.status}). Please try again.`)
-      }
-      const result: ContractExtraction = await response.json()
-      if (!result.original || !Array.isArray(result.warnings) || reviewSections.some(([key]) => !result.original[key])) {
-        throw new Error('The server returned an unexpected extraction result. Please try again.')
-      }
-      setExtraction(result)
-    } catch (error) {
-      setUploadError(controller.signal.aborted
-        ? 'Extraction timed out. Please try again with a smaller PDF.'
-        : error instanceof TypeError
-          ? 'Could not reach the extraction service. Check the backend connection and try again.'
-          : error instanceof Error ? error.message : 'The PDF could not be extracted. Please try again.')
-    } finally {
-      window.clearTimeout(timeout)
-      uploadController.current = null
-      setUploading(false)
-    }
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await fetch(`${api}${path}`, {
+    ...options, cache: 'no-store', signal: options.signal ?? AbortSignal.timeout(30000),
+    headers: { 'X-LCG-Local': '1', ...(typeof options.body === 'string' ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
+  })
+  if (!response.ok) {
+    const data = await response.json().catch(() => null)
+    throw new Error(typeof data?.detail === 'string' ? data.detail : `Request failed (${response.status}).`)
   }
+  return response.status === 204 ? undefined as T : response.json()
+}
+async function all<T>(path: string, signal?: AbortSignal): Promise<T[]> {
+  const result: T[] = []
+  for (let offset = 0; ; offset += 100) {
+    const page = await request<T[]>(`${path}?limit=100&offset=${offset}`, { signal })
+    result.push(...page)
+    if (page.length < 100) return result
+  }
+}
+function failure(error: unknown): string {
+  return error instanceof Error && error.name !== 'TypeError' && error.name !== 'TimeoutError'
+    ? error.message : 'Connection interrupted. Refresh the chat to check what was saved before retrying.'
+}
 
-  const extractedFields = extraction ? Object.values(extraction.original).flatMap(Object.values) : []
-  const extractedCount = extractedFields.filter((field) => field.status === 'extracted').length
-  const missingCount = extractedFields.filter((field) => field.status === 'missing').length
-  const reviewCount = extractedFields.filter((field) => field.status === 'needs_review').length
+function App() {
+  const [conversations, setConversations] = useState<Conversation[]>([])
+  const [active, setActive] = useState<string | null>(() => {
+    try { return localStorage.getItem('lcg-active-chat') } catch { return null }
+  })
+  const [messages, setMessages] = useState<Message[]>([])
+  const [documents, setDocuments] = useState<DocumentRecord[]>([])
+  const [extraction, setExtraction] = useState<ContractExtraction | null>(null)
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const [file, setFile] = useState<File | null>(null)
+  const [loadingHistory, setLoadingHistory] = useState(true)
+  const [loading, setLoading] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const [busy, setBusy] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const [revision, setRevision] = useState(0)
+  const [renaming, setRenaming] = useState(false)
+  const [title, setTitle] = useState('')
+  const [deleting, setDeleting] = useState(false)
+  const mutation = useRef(false)
+  const fileInput = useRef<HTMLInputElement | null>(null)
+  const end = useRef<HTMLDivElement | null>(null)
+  const current = conversations.find(chat => chat.id === active)
+  const draft = active ? drafts[active] ?? '' : ''
 
   useEffect(() => {
     const controller = new AbortController()
-    let active = true
-    const timeout = window.setTimeout(() => controller.abort(), 8000)
+    setLoadingHistory(true)
+    let saved: string | null = null
+    try { saved = localStorage.getItem('lcg-active-chat') } catch { /* Storage can be disabled. */ }
+    void all<Conversation>('/persistence/conversations', controller.signal).then(chats => {
+      if (controller.signal.aborted) return
+      setConversations(chats.reverse())
+      setActive(previous => chats.some(chat => chat.id === previous) ? previous : chats.find(chat => chat.id === saved)?.id ?? chats[0]?.id ?? null)
+    }).catch(cause => { if (!controller.signal.aborted) setError(failure(cause)) })
+      .finally(() => { if (!controller.signal.aborted) setLoadingHistory(false) })
+    return () => controller.abort()
+  }, [revision])
 
-    async function checkHealth() {
-      try {
-        const response = await fetch(healthUrl, {
-          signal: controller.signal,
-          cache: 'no-store',
-        })
-        if (!response.ok) throw new Error('Health check failed')
+  useEffect(() => {
+    const controller = new AbortController()
+    setMessages([]); setDocuments([]); setExtraction(null); setFile(null); setLoaded(false)
+    setRenaming(false); setDeleting(false)
+    if (fileInput.current) fileInput.current.value = ''
+    try {
+      if (active) localStorage.setItem('lcg-active-chat', active)
+      else localStorage.removeItem('lcg-active-chat')
+    } catch { /* Only the selected ID is cached; content always comes from PostgreSQL. */ }
+    if (!active) { setLoading(false); return () => controller.abort() }
+    setLoading(true)
+    void Promise.all([
+      all<Message>(`/persistence/conversations/${active}/messages`, controller.signal),
+      all<DocumentRecord>(`/persistence/conversations/${active}/documents`, controller.signal),
+    ]).then(([savedMessages, savedDocuments]) => {
+      if (!controller.signal.aborted) { setMessages(savedMessages); setDocuments(savedDocuments); setLoaded(true) }
+    }).catch(cause => { if (!controller.signal.aborted) setError(failure(cause)) })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false) })
+    return () => controller.abort()
+  }, [active, revision])
 
-        const health: unknown = await response.json()
-        if (
-          typeof health !== 'object' ||
-          health === null ||
-          !('status' in health) ||
-          health.status !== 'ok' ||
-          !('service' in health) ||
-          health.service !== 'lcg-backend'
-        ) {
-          throw new Error('Unexpected health response')
-        }
+  useEffect(() => { end.current?.scrollIntoView({ block: 'nearest' }) }, [messages.length, documents.length, active])
 
-        if (active) setConnection('connected')
-      } catch {
-        if (active) setConnection('error')
-      } finally {
-        window.clearTimeout(timeout)
+  async function mutate(label: string, action: () => Promise<void>) {
+    if (mutation.current) return
+    mutation.current = true; setBusy(label); setError(null)
+    try { await action() } catch (cause) { setError(failure(cause)) }
+    finally { mutation.current = false; setBusy('') }
+  }
+  function switchChat(id: string) {
+    if (mutation.current) return
+    setError(null); setActive(id)
+  }
+  function newChat() {
+    void mutate('Creating chat…', async () => {
+      const chat = await request<Conversation>('/persistence/conversations', { method: 'POST', body: JSON.stringify({ title: 'New chat' }) })
+      setConversations(previous => [chat, ...previous]); setActive(chat.id)
+    })
+  }
+  function rename(event: FormEvent) {
+    event.preventDefault()
+    if (!active || !title.trim()) return
+    void mutate('Renaming…', async () => {
+      const chat = await request<Conversation>(`/persistence/conversations/${active}`, { method: 'PATCH', body: JSON.stringify({ title: title.trim() }) })
+      setConversations(previous => previous.map(item => item.id === chat.id ? chat : item)); setRenaming(false)
+    })
+  }
+  function deleteChat() {
+    if (!active) return
+    void mutate('Deleting chat…', async () => {
+      await request(`/persistence/conversations/${active}`, { method: 'DELETE' })
+      const remaining = conversations.filter(chat => chat.id !== active)
+      setConversations(remaining); setActive(remaining[0]?.id ?? null); setDeleting(false)
+      setDrafts(previous => { const next = { ...previous }; delete next[active]; return next })
+    })
+  }
+  function submit(event: FormEvent) {
+    event.preventDefault()
+    if (!active || !loaded || (!draft.trim() && !file)) return
+    const chatId = active
+    void mutate(file ? 'Saving and extracting PDF…' : 'Saving message…', async () => {
+      if (draft.trim()) {
+        const message = await request<Message>(`/persistence/conversations/${chatId}/messages`, { method: 'POST', body: JSON.stringify({ role: 'user', content: draft.trim() }) })
+        setMessages(previous => [...previous, message]); setDrafts(previous => ({ ...previous, [chatId]: '' }))
       }
-    }
+      if (file) {
+        const body = new FormData(); body.append('file', file)
+        const saved = await request<ContractExtraction>(`/contracts/extract?conversation_id=${chatId}`, { method: 'POST', body })
+        setFile(null); if (fileInput.current) fileInput.current.value = ''
+        setExtraction(saved)
+        setDocuments(await all<DocumentRecord>(`/persistence/conversations/${chatId}/documents`))
+      }
+    })
+  }
+  const timeline = [
+    ...messages.map(message => ({ kind: 'message' as const, value: message })),
+    ...documents.map(document => ({ kind: 'document' as const, value: document })),
+  ].sort((a, b) => a.value.created_at.localeCompare(b.value.created_at) || a.value.id.localeCompare(b.value.id))
 
-    void checkHealth()
-    return () => {
-      active = false
-      window.clearTimeout(timeout)
-      controller.abort()
-    }
-  }, [checkAttempt])
-
-  return (
-    <div className="app-shell">
-      <a className="skip-link" href="#workspace">Skip to workspace</a>
-      <header className="app-header">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true">L</span>
-          <div>
-            <h1>LCG Command Center</h1>
-            <p>Learning Care Group</p>
-          </div>
-        </div>
-        <div className="connection-controls">
-          <div className={`connection-status ${connection}`} role="status" aria-atomic="true">
-            <span className="status-dot" aria-hidden="true" />
-            {connection === 'loading' && 'Checking backend…'}
-            {connection === 'connected' && 'Backend connected'}
-            {connection === 'error' && 'Backend unavailable'}
-          </div>
-          <button
-            className="connection-button"
-            type="button"
-            disabled={connection === 'loading'}
-            onClick={() => {
-              setConnection('loading')
-              setCheckAttempt((attempt) => attempt + 1)
-            }}
-          >
-            {connection === 'error' ? 'Retry connection' : 'Check connection'}
-          </button>
-        </div>
-      </header>
-
-      <main id="workspace" tabIndex={-1}>
-        <div className="workspace-heading">
-          <div>
-            <p className="eyebrow">OPERATIONS WORKSPACE</p>
-            <h2>One place to work together.</h2>
-            <p>Contract setup, with your AI coworker and browser side by side.</p>
-          </div>
-          <span className="foundation-badge">Read-only LCW exploration</span>
-        </div>
-
-        {connection === 'error' && (
-          <div className="connection-notice">
-            <strong>We couldn’t reach the backend.</strong>{' '}
-            Check that the local server is running at <code>http://127.0.0.1:8000</code>,
-            then retry the connection. You can still explore the workspace.
-          </div>
-        )}
-
-        <div className="workspace-grid">
-          <section className="panel coworker-panel" aria-labelledby="coworker-title">
-            <header className="panel-header">
-              <span className="panel-icon coworker-icon" aria-hidden="true">✦</span>
-              <div>
-                <h2 id="coworker-title">AI Coworker</h2>
-                <p>Your conversation workspace</p>
+  return <div className="app-shell">
+    <a className="skip-link" href="#workspace">Skip to workspace</a>
+    <header className="app-header"><div className="brand"><span className="brand-mark" aria-hidden="true">L</span><div><h1>LCG Command Center</h1><p>Conversations and contracts</p></div></div><span className="foundation-badge">Your workspace</span></header>
+    <main id="workspace" tabIndex={-1}>
+      <div className="workspace-grid">
+        <section className="panel chat-panel" aria-label="Conversation workspace">
+          <aside className="chat-history" aria-label="Conversation history">
+            <button className="extract-button" disabled={!!busy || loadingHistory} onClick={newChat}>＋ New Chat</button>
+            <h2>Chats</h2>
+            {loadingHistory && <p role="status">Loading history…</p>}
+            <nav aria-label="Saved conversations">{conversations.map(chat => <button key={chat.id} className={`history-item ${chat.id === active ? 'selected' : ''}`} disabled={!!busy || loadingHistory}
+              aria-current={chat.id === active ? 'page' : undefined} onClick={() => switchChat(chat.id)}><span>{chat.title}</span><time dateTime={chat.created_at}>{new Date(chat.created_at).toLocaleDateString()}</time></button>)}</nav>
+            {!loadingHistory && !conversations.length && <p>No saved chats yet.</p>}
+          </aside>
+          <div className="chat-main">
+            <header className="chat-header"><h2>{current?.title ?? 'Start a conversation'}</h2>
+              <div className="chat-tools">
+                <button className="connection-button" disabled={!current || !!busy || loading} onClick={() => { setTitle(current!.title); setRenaming(!renaming); setDeleting(false) }}>Rename</button>
+                <button className="connection-button" disabled={!current || !!busy || loading} onClick={() => { setDeleting(!deleting); setRenaming(false) }}>Delete</button>
+                <button className="connection-button" disabled={!!busy || loadingHistory || loading} onClick={() => { setError(null); setRevision(value => value + 1) }}>Refresh chats</button>
               </div>
-              <span className="panel-tag">Document review</span>
             </header>
-
-            <div className="conversation-content">
-              <p className="section-label">START WITH A DOCUMENT</p>
-              <div className="welcome-message">
-                <h3>Review a subsidy contract.</h3>
-                <p>Upload the training contract to extract its details, review the source values, and see what needs attention.</p>
-                <div className="preview-note">Original document values only. Nothing is submitted to LCW.</div>
-              </div>
-
-              <form className="contract-upload" onSubmit={uploadContract} aria-busy={uploading}>
-                <label htmlFor="contract-file">Select a contract PDF</label>
-                <input
-                  id="contract-file"
-                  type="file"
-                  accept=".pdf,application/pdf"
-                  disabled={uploading}
-                  aria-describedby="upload-help"
-                  onChange={(event) => {
-                    const file = event.target.files?.[0] ?? null
-                    setExtraction(null)
-                    setUploadError(null)
-                    setSelectedFile(null)
-                    if (file && (!file.name.toLowerCase().endsWith('.pdf') || file.size === 0 || file.size > 5 * 1024 * 1024)) {
-                      setUploadError('Choose a non-empty PDF file no larger than 5 MB.')
-                      event.target.value = ''
-                      return
-                    }
-                    setSelectedFile(file)
-                  }}
-                />
-                <p id="upload-help">Text-based PDF · Up to 5 MB and 10 pages. Uploaded documents are not saved.</p>
-                <button className="extract-button" type="submit" disabled={!selectedFile || uploading}>
-                  {uploading ? 'Extracting contract…' : extraction ? 'Extract again' : 'Extract contract'}
-                </button>
-              </form>
-              <div role="status" aria-atomic="true" className="extraction-status">
-                {uploading && 'Reading the PDF and checking its fields…'}
-                {extraction && `${extractedCount} fields extracted · ${missingCount} missing or unassigned · ${reviewCount} need review`}
-              </div>
-              {uploadError && <p className="upload-error" role="alert">{uploadError}</p>}
-
-              {extraction && (
-                <section className="contract-review" aria-labelledby="review-title">
-                  <h3 id="review-title">Original contract review</h3>
-                  <p className="review-description">{selectedFile?.name ?? 'Restored PDF extraction'} · {extraction.page_count} {extraction.page_count === 1 ? 'page' : 'pages'}. Expand each section to compare normalized values with the source. Values are read-only.</p>
-                  {extraction.warnings.length > 0 && (
-                    <div className="review-warnings">
-                      <h4>Review notes</h4>
-                      <ul>{extraction.warnings.map((warning) => <li key={warning.code}>{warning.message}</li>)}</ul>
-                    </div>
-                  )}
-                  <div className="review-sections">
-                    {reviewSections.map(([key, title]) => (
-                      <details key={key} open={key === 'identity' || key === 'existing_pra'}>
-                        <summary>{title}<span>{Object.values(extraction.original[key]).some((field) => field.status !== 'extracted') ? 'Needs attention' : 'All extracted'}</span></summary>
-                        <dl>
-                          {Object.entries(extraction.original[key]).map(([name, field]) => (
-                            <div key={name} className={`review-field field-${field.status}`}>
-                              <dt>{fieldLabel(name)}<span className="field-status">{field.status === 'extracted' ? 'Extracted' : field.status === 'missing' ? 'Missing / unassigned' : 'Needs review'}</span></dt>
-                              <dd>
-                                <p className="field-value">{field.value === null ? field.status === 'needs_review' ? 'Review source value' : 'Not provided / not assigned' : displayValue(field.value)}</p>
-                                {field.original && <p className="field-source">Source · page {field.source_page}: {field.original}</p>}
-                                {!field.original && <p className="field-source">No value found in the document.</p>}
-                              </dd>
-                            </div>
-                          ))}
-                        </dl>
-                      </details>
-                    ))}
-                  </div>
-                </section>
-              )}
+            {renaming && <form className="chat-rename" onSubmit={rename}><label htmlFor="chat-title">Chat name</label><input id="chat-title" autoFocus maxLength={200} value={title} onChange={event => setTitle(event.target.value)} disabled={!!busy} /><button className="connection-button" disabled={!!busy || !title.trim()}>Save</button><button className="connection-button" type="button" onClick={() => setRenaming(false)}>Cancel</button></form>}
+            {deleting && <div className="chat-delete" role="alert"><p>Delete this chat and its messages? Extracted document records are retained.</p><button className="connection-button" disabled={!!busy} onClick={deleteChat}>Delete chat</button><button className="connection-button" disabled={!!busy} onClick={() => setDeleting(false)}>Cancel</button></div>}
+            {error && <p className="upload-error chat-error" role="alert">{error}</p>}
+            <div className="chat-transcript" aria-label="Messages and attachments" aria-busy={loading}>
+              {loading ? <p className="chat-placeholder" role="status">Loading conversation…</p> : <>
+                {!timeline.length && <div className="chat-placeholder"><h3>{active ? 'What would you like to work on?' : 'A place for your work.'}</h3><p>{active ? 'Save a message or attach a contract PDF.' : 'Create a new chat to save messages and contract details.'}</p><p>AI replies are not connected yet.</p></div>}
+                {timeline.map(item => item.kind === 'message' ? <article key={item.value.id} className={`chat-message ${item.value.role === 'user' ? 'from-user' : ''}`}>
+                  <header><strong>{item.value.role === 'user' ? 'You' : fieldLabel(item.value.role)}</strong><time dateTime={item.value.created_at}>{timestamp(item.value.created_at)}</time></header><p>{item.value.content}</p>
+                </article> : <article className="chat-attachment" key={item.value.id}>
+                  <header><strong>▤ {item.value.metadata.filename}</strong><time dateTime={item.value.created_at}>{timestamp(item.value.created_at)}</time></header>
+                  <p>{item.value.extraction.page_count} page(s) · Extracted information saved</p>
+                  <button className="connection-button" disabled={!!busy || extraction?.extraction_id === item.value.id} onClick={() => void mutate('Selecting document…', async () => {
+                    setExtraction(await request<ContractExtraction>(`/contracts/${item.value.id}/select`, { method: 'POST' }))
+                  })}>{extraction?.extraction_id === item.value.id ? 'Selected for inspection' : 'Use for inspection'}</button>
+                  <details><summary>Review extracted information</summary>
+                    {item.value.extraction.warnings.length > 0 && <ul className="review-warnings">{item.value.extraction.warnings.map(warning => <li key={warning.code}>{warning.message}</li>)}</ul>}
+                    <div className="review-sections">{reviewSections.map(([key, title]) => <details key={key}><summary>{title}</summary><dl>{Object.entries(item.value.extraction.original[key] ?? {}).map(([name, field]) => <div className={`review-field field-${field.status}`} key={name}><dt>{fieldLabel(name)} <span className="field-status">{fieldLabel(field.status)}</span></dt><dd><p className="field-value">{displayValue(field.value)}</p><p className="field-source">{field.original ? `Source · page ${field.source_page}: ${field.original}` : 'No source value.'}</p></dd></div>)}</dl></details>)}</div>
+                  </details>
+                </article>)}
+              </>}
+              <div ref={end} />
             </div>
-
-            <div className="composer">
-              <label htmlFor="message">Message your coworker</label>
-              <div className="composer-input">
-                <textarea id="message" placeholder="Conversation is coming soon…" disabled rows={2} aria-describedby="composer-note" />
-                <button type="button" className="send-button" disabled aria-label="Send message (coming soon)">↑</button>
-              </div>
-              <p id="composer-note">Chat is not connected in this preview.</p>
-            </div>
-          </section>
-
-          <BrowserWorkspace extraction={extraction} onRestore={(stored) => setExtraction((current) => current ?? stored)} />
-        </div>
-        <footer className="workspace-footer">
-          <span>Built around your workflow. Guided by you.</span>
-          <span>LCG · Command Center</span>
-        </footer>
-      </main>
-    </div>
-  )
+            <form className="composer chat-composer" onSubmit={submit} aria-busy={!!busy}>
+              <label htmlFor="chat-message">Message</label>
+              <div className="composer-input"><textarea id="chat-message" rows={3} maxLength={20000} placeholder="Write a message…" disabled={!active || !loaded || !!busy || loadingHistory}
+                value={draft} onChange={event => { if (active) setDrafts(previous => ({ ...previous, [active]: event.target.value })) }}
+                onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} />
+                <button className="send-button" aria-label="Send message or upload PDF" disabled={!active || !loaded || !!busy || loadingHistory || (!draft.trim() && !file)}>↑</button></div>
+              <div className="chat-upload"><label className="connection-button" htmlFor="chat-pdf">Attach PDF</label><input ref={fileInput} id="chat-pdf" type="file" accept=".pdf,application/pdf" disabled={!active || !loaded || !!busy} onChange={event => {
+                const selected = event.target.files?.[0] ?? null
+                setError(null); setFile(null)
+                if (selected && (!selected.name.toLowerCase().endsWith('.pdf') || selected.size === 0 || selected.size > 5 * 1024 * 1024)) { setError('Choose a non-empty PDF up to 5 MB.'); event.target.value = ''; return }
+                setFile(selected)
+              }} />{file && <><span>{file.name}</span><button type="button" className="connection-button" disabled={!!busy} onClick={() => { setFile(null); if (fileInput.current) fileInput.current.value = '' }}>Remove</button></>}</div>
+              <p role="status">{busy || 'Messages and extracted details are saved. Original PDF files are not retained.'}</p>
+            </form>
+          </div>
+        </section>
+        <BrowserWorkspace extraction={extraction} onRestore={ignoreBrowserRestore} />
+      </div>
+    </main>
+  </div>
 }
-
 export default App

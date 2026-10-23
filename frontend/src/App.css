@@ -220,3 +220,57 @@ main { max-width: 1600px; margin: 0 auto; padding: 34px 40px 20px; }
 .comparison-different { background: #fff5e7; }
 .comparison-missing { background: #fff2ee; }
 .comparison-matching { background: #f2f9f4; }
+
+/* Persistent conversation workspace; browser styles remain unchanged. */
+.chat-panel { display: grid; grid-template-columns: 145px minmax(0, 1fr); height: min(840px, calc(100vh - 145px)); min-height: 580px; }
+.chat-history { background: #f7f9fb; border-right: 1px solid #e5e9ee; padding: 14px 10px; overflow-y: auto; }
+.chat-history .extract-button { padding: 10px 8px; font-size: 12px; }
+.chat-history h2 { font-size: 11px; margin: 24px 8px 10px; color: #7a8794; }
+.chat-history > p { font-size: 11px; color: #6a7a8c; padding: 8px; }
+.history-item { width: 100%; background: transparent; border: 0; text-align: left; padding: 11px 9px; border-radius: 7px; color: #435568; margin-bottom: 3px; }
+.history-item:hover, .history-item.selected { background: #e8eef5; }
+.history-item span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.history-item time { font-size: 9px; color: #7b8998; }
+.chat-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.chat-header { border-bottom: 1px solid #e9edf2; padding: 16px; }
+.chat-header h2 { font-size: 14px; overflow-wrap: anywhere; margin-bottom: 10px; }
+.chat-tools { display: flex; flex-wrap: wrap; gap: 5px; }
+.chat-tools .connection-button { padding: 5px 8px; min-height: 30px; font-size: 10px; }
+.chat-transcript { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 16px; }
+.chat-placeholder { padding: 45px 5px; text-align: center; color: #758291; font-size: 12px; }
+.chat-placeholder h3 { font-size: 20px; color: #364d62; font-weight: 500; }
+.chat-placeholder p { margin-top: 12px; }
+.chat-message, .chat-attachment { margin: 0 0 18px; font-size: 13px; overflow-wrap: anywhere; }
+.chat-message header, .chat-attachment header { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; margin-bottom: 8px; }
+.chat-message time, .chat-attachment time { font-size: 9px; color: #768493; }
+.chat-message > p { white-space: pre-wrap; line-height: 1.65; }
+.chat-message.from-user { margin-left: 18px; background: #edf2f7; border-radius: 14px 14px 3px 14px; padding: 14px; }
+.chat-attachment { border: 1px solid #dce4ed; border-radius: 10px; padding: 12px; background: #fafcfe; }
+.chat-attachment > p { color: #708091; font-size: 11px; margin-bottom: 10px; }
+.chat-attachment summary { cursor: pointer; padding: 10px 0; font-size: 11px; }
+.chat-attachment .review-sections { max-height: 350px; }
+.chat-composer { padding: 12px 14px; }
+.chat-composer textarea { color: #233343; font-size: 13px; }
+.chat-composer .send-button:not(:disabled) { background: #294e72; color: white; }
+.chat-upload { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.chat-upload > label { margin: 0; cursor: pointer; }
+.chat-upload > span { font-size: 11px; overflow-wrap: anywhere; min-width: 0; }
+.chat-upload input[type=file] { width: 1px; height: 1px; position: absolute; clip-path: inset(50%); }
+.chat-upload:focus-within > label { outline: 2px solid #416cc2; }
+.chat-rename, .chat-delete { padding: 12px 16px; background: #f8fafc; display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px; }
+.chat-rename input { min-width: 0; width: 100%; border: 1px solid #cbd6e1; border-radius: 5px; padding: 8px; font: inherit; }
+.chat-delete p { width: 100%; }
+.chat-error { margin: 10px 14px; }
+@media (max-width: 1200px) and (min-width: 801px) {
+  .chat-panel { grid-template-columns: 115px minmax(0, 1fr); }
+}
+@media (max-width: 800px) {
+  .chat-panel { height: 750px; grid-template-columns: 130px minmax(0, 1fr); }
+}
+@media (max-width: 480px) {
+  .chat-panel { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: 800px; }
+  .chat-history { max-height: 165px; border-right: 0; border-bottom: 1px solid #e5e9ee; }
+  .chat-history h2 { margin: 10px 8px 4px; }
+  .chat-history nav { display: flex; gap: 6px; overflow-x: auto; }
+  .history-item { min-width: 120px; max-width: 180px; }
+}

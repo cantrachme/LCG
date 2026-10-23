@@ -142,6 +142,16 @@ def test_postgres_schema_crud_extraction_and_restart(monkeypatch):
             assert saved['extraction']['warnings']
             assert saved['extraction']['original']['identity']['child_id']['original'] == '001234'
             assert saved['metadata']['page_count'] == 1
+            attachments = client.get(f'/api/persistence/conversations/{conversation}/documents', headers=HEADERS)
+            assert attachments.status_code == 200
+            assert [record['id'] for record in attachments.json()] == [document_id]
+            other = client.post('/api/persistence/conversations', headers=HEADERS, json={'title': 'Other chat'}).json()['id']
+            assert client.get(f'/api/persistence/conversations/{other}/documents', headers=HEADERS).json() == []
+            assert client.get(f'/api/persistence/conversations/{other}/messages', headers=HEADERS).json() == []
+            selected = client.post(f'/api/contracts/{document_id}/select', headers=HEADERS)
+            assert selected.status_code == 200 and selected.json() == extracted
+            assert main.session.document_id == document_id
+            assert client.get(f'/api/persistence/conversations/{uuid4()}/documents', headers=HEADERS).status_code == 404
             workflow = client.post('/api/persistence/workflow-runs', headers=HEADERS, json={'document_id': document_id})
             assert workflow.status_code == 201
             run_id = workflow.json()['id']
@@ -158,6 +168,9 @@ def test_postgres_schema_crud_extraction_and_restart(monkeypatch):
         configure_schema()
         with TestClient(main.app) as client:
             assert client.get('/api/browser/document', headers=HEADERS).json() == extracted
+            assert client.get(f'/api/persistence/conversations/{conversation}', headers=HEADERS).json()['title'] == 'Updated'
+            assert client.get(f'/api/persistence/conversations/{conversation}/messages', headers=HEADERS).json()[0]['content'] == 'Synthetic message'
+            assert client.get(f'/api/persistence/conversations/{conversation}/documents', headers=HEADERS).json()[0]['extraction'] == extracted
             assert client.get('/api/persistence/workflow-runs/'+run_id, headers=HEADERS).json()['state'] == 'paused'
             assert replacement.job['state'] == 'paused'
             assert replacement.task is None and replacement.browser is None
@@ -170,3 +183,22 @@ def test_postgres_schema_crud_extraction_and_restart(monkeypatch):
         with admin.begin() as connection:
             connection.execute(text(f'DROP SCHEMA {schema} CASCADE'))
         admin.dispose()
+
+
+def test_document_selection_only_loads_saved_data(monkeypatch):
+    from app.contracts import extract_contract
+    from unittest.mock import MagicMock
+    identifier = str(uuid4())
+    extracted = extract_contract(pdf()).model_copy(update={'extraction_id': identifier})
+    monkeypatch.setattr(database, 'read', lambda name, key: {'extraction': extracted.model_dump(mode='json')})
+    client = TestClient(main.app)
+    assert client.post(f'/api/contracts/{identifier}/select').status_code == 403
+    main.session.task = MagicMock(done=lambda: False)
+    main.session.document_id = str(uuid4())
+    assert client.post(f'/api/contracts/{identifier}/select', headers=HEADERS).status_code == 409
+    main.session.task = None
+    response = client.post(f'/api/contracts/{identifier}/select', headers=HEADERS)
+    assert response.status_code == 200
+    assert response.headers['cache-control'] == 'no-store'
+    assert main.session.document_id == identifier
+    assert main.session.browser is None

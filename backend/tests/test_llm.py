@@ -245,3 +245,76 @@ def test_postgres_ai_messages_tools_idempotency_and_restart(monkeypatch):
         database.dispose()
         with admin.begin() as c: c.execute(text(f'DROP SCHEMA {schema} CASCADE'))
         admin.dispose()
+
+
+def setup_observation(document):
+    from app.contracts import ContractExtraction
+    from app.inspection import build_result, expected_identity
+    source = ContractExtraction.model_validate(document['extraction'])
+    auth, pra = source.original.authorization, source.original.existing_pra
+    contracts = [{'contract_id': 'synthetic-existing', 'agency': source.original.identity.agency.value,
+                  'start_date': str(auth.start_date.value), 'end_date': str(auth.end_date.value), 'evidence': 'Synthetic table'}]
+    assignments = [{'classroom': source.original.schedule.classroom.value, 'center': source.original.identity.center.value,
+                    'start_date': str(pra.start_date.value), 'end_date': str(pra.end_date.value), 'evidence': 'Synthetic table'}]
+    return source, build_result(source, expected_identity(source), contracts, assignments)
+
+
+def test_setup_maps_values_without_authorizing_writes(setup):
+    from app.inspection import prepare_contract_setup
+    source, observed = setup_observation(setup.document)
+    plan = prepare_contract_setup(source, observed)
+    assert len(plan['steps']) == 6
+    assert plan['contract_id'] == 'synthetic-existing'
+    assert plan['contract_action'] == 'review_existing'
+    assert plan['pra_action'] == 'reuse_required'
+    assert plan['state'] == 'blocked' and not plan['saved'] and not plan['approval_available']
+    rates = {item['field']: item for item in plan['changes']}
+    assert rates['part_time.weekly_unit_rate']['proposed'] == str(source.original.part_time.weekly_unit_rate.value)
+    assert all(not item['selector_verified'] and not item['approved'] for item in rates.values())
+    assert source.model_dump(mode='json') == setup.document['extraction']
+
+
+@pytest.mark.parametrize('key', ['child_id', 'family_id', 'center'])
+def test_setup_rejects_identity_changes(setup, key):
+    from app.inspection import prepare_contract_setup, InspectionError
+    source, observed = setup_observation(setup.document)
+    observed['identity'][key] = 'wrong'
+    with pytest.raises(InspectionError):
+        prepare_contract_setup(source, observed)
+
+
+def test_setup_blocks_duplicates_and_coverage_conflicts(setup):
+    from app.inspection import prepare_contract_setup
+    source, observed = setup_observation(setup.document)
+    observed['contracts'] *= 2
+    observed['assignments'] *= 2
+    observed['coverage'] = {'status': 'different'}
+    plan = prepare_contract_setup(source, observed)
+    assert plan['contract_action'] == 'decision_required'
+    assert plan['existing_pra'] is None
+    assert any('coverage' in blocker for blocker in plan['blockers'])
+    assert not plan['approval_available']
+    observed['contracts'] = []
+    assert prepare_contract_setup(source, observed)['contract_action'] == 'decision_required'
+
+
+def test_setup_chat_persists_blocked_plan_without_save_or_retry(setup, monkeypatch):
+    s = setup
+    _, observed = setup_observation(s.document)
+    saved = []
+    monkeypatch.setattr(database, 'configured', lambda: True)
+    monkeypatch.setattr(database, 'save_workflow', lambda job: saved.append(copy.deepcopy(job)))
+    async def begin(request, source=None):
+        s.session.job = {'id': str(uuid4()), 'state': 'completed', 'result': observed}
+        return {'inspection': {'id': s.session.job['id']}}
+    s.session.begin = AsyncMock(side_effect=begin)
+    s.responses.append(reply(tool='prepare_contract_setup', arguments='{"document_id":null}'))
+    run_turn(s, [{'role': 'user', 'content': 'Set up the synthetic contract.'}], s.document)
+    tool = next(json.loads(row['content']) for row in s.rows.values() if row['role'] == 'tool')
+    assert tool['kind'] == 'setup_plan' and tool['state'] == 'blocked' and not tool['verified']
+    assert saved[0]['result']['setup_plan'] == tool['result']
+    assert json.loads(s.rows[s.turn['id']]['content'])['state'] == 'paused'
+    assert len(s.captured) == 1
+    assert not tool['result']['saved']
+    s.session.start.assert_not_awaited()
+    s.session.login.assert_not_awaited()

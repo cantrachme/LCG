@@ -15,6 +15,52 @@ class InspectionError(Exception):
     """Fixed operator-facing message, never raw page/exception content."""
 
 
+def prepare_contract_setup(source, result):
+    """Prepare review data only. Write selectors have not been observed in LCW."""
+    expected = expected_identity(source)
+    identity = result.get('identity', {})
+    if any(normalized(identity.get(key)) != normalized(expected[key])
+           for key in ('child_name', 'child_id', 'family_id', 'center')):
+        raise InspectionError('Setup blocked: child, family and center must match the PDF.')
+    blockers = ['Contract/PRA edit, rate/copay, save and post-save controls have not been observed. No form input or save is permitted.',
+                'The reference video is unavailable for reconciliation. Operator review is required.']
+    contracts, assignments = result.get('contracts', []), result.get('assignments', [])
+    contract, reason = choose_record(contracts, source.original.authorization.start_date.value,
+                                    source.original.authorization.end_date.value, source.original.identity.agency.value)
+    assignment, pra_reason = choose_record(assignments, source.original.existing_pra.start_date.value,
+                                          source.original.existing_pra.end_date.value)
+    if not contract or reason not in {'single', 'exact'}:
+        blockers.append('Resolve missing, unreadable or ambiguous existing contracts; creation is not authorized.')
+    if not assignment or pra_reason not in {'single', 'exact'}:
+        blockers.append('Resolve missing, unreadable or ambiguous existing PRA; never create a replacement automatically.')
+    if result.get('coverage', {}).get('status') != 'matching':
+        blockers.append('PRA coverage is conflicting or unverified. Explicitly resolve contract dates versus existing PRA coverage before proceeding.')
+    comparison = compare_fields(source, {})  # Every source field, even if caller omitted comparison rows.
+    observed = {row['field']: row['portal'] for row in result.get('comparison', [])}
+    changes = []
+    for row in comparison:
+        field = row['document']
+        portal = observed.get(row['field'], row['portal'])
+        changes.append({'field': row['field'], 'source': field, 'current': portal,
+                        'proposed': field['value'] if field['status'] == 'extracted' else None,
+                        'selector_verified': False, 'approved': False})
+    review = [item['field'] for item in changes if item['source']['status'] != 'extracted']
+    return {'state': 'blocked', 'saved': False, 'approval_available': False,
+            'identity': identity, 'contract_id': contract.get('contract_id') if contract else None,
+            'contract_action': 'review_existing' if contract else 'decision_required',
+            'pra_action': 'reuse_required' if source.original.existing_pra.reuse_required.value is True else 'decision_required',
+            'existing_pra': assignment, 'coverage': result.get('coverage'), 'changes': changes,
+            'missing_or_unreviewed_fields': review,
+            'warnings': [warning.model_dump() for warning in source.warnings], 'blockers': blockers,
+            'steps': [{'name': name, 'state': state} for name, state in (
+                ('Extract contract values', 'needs_review' if review or source.warnings else 'completed'),
+                ('Verify child', 'completed'), ('Prepare contract', 'blocked'),
+                ('Configure unit rates/copays', 'blocked'), ('Verify or prepare PRA', 'needs_review'),
+                ('Save and verify approved changes', 'blocked'))],
+            'message': 'Setup is blocked. Review the proposed source values and conflicts. No LCW values were changed. '
+                       'Exact form changes, explicit operator approval and observed read-back controls are required before any save.'}
+
+
 def normalized(value):
     return re.sub(r"\s+", " ", str(value)).strip().casefold()
 

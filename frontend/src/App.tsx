@@ -61,12 +61,14 @@ const timestamp = (value: string) => new Date(value).toLocaleString()
 
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`${api}${path}`, {
-    ...options, cache: 'no-store', signal: options.signal ?? AbortSignal.timeout(30000),
+    ...options, cache: 'no-store', signal: options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000),
     headers: { 'X-LCG-Local': '1', ...(typeof options.body === 'string' ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
   })
   if (!response.ok) {
     const data = await response.json().catch(() => null)
-    throw new Error(typeof data?.detail === 'string' ? data.detail : `Request failed (${response.status}).`)
+    throw new Error(response.status === 404 && data?.detail === 'Not Found'
+      ? 'The backend is missing this API. Restart the backend with the current application code, then refresh chats.'
+      : typeof data?.detail === 'string' ? data.detail : `Request failed (${response.status}).`)
   }
   return response.status === 204 ? undefined as T : response.json()
 }
@@ -216,7 +218,7 @@ function App() {
   }
   function submit(event: FormEvent) {
     event.preventDefault()
-    if (!active || !loaded || aiRunning || (!draft.trim() && !file)) return
+    if (!active || aiRunning || (!draft.trim() && !file)) return
     const chatId = active
     void mutate(file ? 'Saving and extracting PDF…' : 'Saving message…', async () => {
       let userMessage: Message | null = null
@@ -299,11 +301,13 @@ function App() {
                   : <p>AI unavailable: configure the model endpoint, model and API key on the backend. Messages can still be saved.</p>}
               </div>
               <label htmlFor="chat-message">Message</label>
-              <div className="composer-input"><textarea id="chat-message" rows={3} maxLength={20000} placeholder="Write a message…" disabled={!active || !loaded || !!busy || loadingHistory || aiRunning}
+              {!active && <p role="status">Choose New Chat to enable messages and PDF uploads. If creation fails, the error appears above; you can retry.</p>}
+              {active && !loaded && !loading && <p role="status">Conversation history could not load. You can still save a message or attach a PDF; use Refresh chats to reload history.</p>}
+              <div className="composer-input"><textarea id="chat-message" rows={3} maxLength={20000} placeholder="Write a message…" disabled={!active || !!busy || aiRunning}
                 value={draft} onChange={event => { if (active) setDrafts(previous => ({ ...previous, [active]: event.target.value })) }}
                 onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} />
-                <button className="send-button" aria-label="Send message or upload PDF" disabled={!active || !loaded || !!busy || loadingHistory || aiRunning || (!draft.trim() && !file)}>↑</button></div>
-              <div className="chat-upload"><label className="connection-button" htmlFor="chat-pdf">Attach PDF</label><input ref={fileInput} id="chat-pdf" type="file" accept=".pdf,application/pdf" disabled={!active || !loaded || !!busy} onChange={event => {
+                <button className="send-button" aria-label="Send message or upload PDF" disabled={!active || !!busy || aiRunning || (!draft.trim() && !file)}>↑</button></div>
+              <div className="chat-upload"><label className="connection-button" htmlFor="chat-pdf">Attach PDF</label><input ref={fileInput} id="chat-pdf" type="file" accept=".pdf,application/pdf" disabled={!active || !!busy || aiRunning} onChange={event => {
                 const selected = event.target.files?.[0] ?? null
                 setError(null); setFile(null)
                 if (selected && (!selected.name.toLowerCase().endsWith('.pdf') || selected.size === 0 || selected.size > 5 * 1024 * 1024)) { setError('Choose a non-empty PDF up to 5 MB.'); event.target.value = ''; return }

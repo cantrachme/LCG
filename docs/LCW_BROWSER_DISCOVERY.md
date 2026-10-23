@@ -143,3 +143,19 @@ With the frontend already running, opt into the isolated live test: `LCG_BROWSER
 Run frontend checks from `frontend`: `npm run lint`, `npx tsc -b --pretty false`, `npm run build`.
 Run one backend worker without reload: `.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log --ws-max-size 16384`.
 No dependencies or environment files were added. No work on Steps 2–5 was performed.
+
+## Step 5 — preparation implemented; writes blocked
+
+Chat now exposes `prepare_contract_setup`, which reuses the existing session and read-only inspection. It independently checks child/family/center identity, prepares a six-step review plan, preserves PDF provenance and warnings, lists proposed values and unknown current values, identifies existing contracts for reconciliation, and flags PRA reuse and coverage conflicts. The blocked plan is retained in the existing workflow result and chat tool record. Refresh/restart cannot authorize or replay a save.
+
+This is **not complete contract automation**. The reference video is unavailable in the workspace. The discovery above did not observe contract/PRA edit forms, rate/copay controls, save controls or post-save read-back selectors. No write implementation, actionable approval or automatic correction application is enabled. Existing generic approval records cannot authorize this plan. Chat corrections remain proposals requiring confirmation; they do not alter PDF values or LCW. No selectors or field values were fabricated. No LCW session, login or write was initiated to test this step.
+
+To finish: inspect those forms in the existing operator-authenticated embedded session, reconcile the video and supplied PDF with current records, bind each exact change to an immutable approval and fresh identity/record checks, then implement serialized saves and independent post-save rereads. Any real write verification requires specific operator authorization; approval alone must not bypass unresolved PRA coverage or missing selectors.
+
+## Step 5A — discovery blocked (2026-10-23)
+
+The running local backend's browser status returned `state: idle`, `active: false`, `authenticated: false`, `owner: agent`, `busy: false`. No active authenticated controlled page was available through the application. Per the discovery restrictions, work stopped at this prerequisite check; no browser launch, login/MFA, record navigation, form interaction or save was attempted. This status does not establish whether a detached Chromium process still exists.
+
+No new fields, selectors, dropdown options, validation behavior, edit navigation or post-save verification paths were verified. The historical findings above remain historical. Contract/PRA form discovery requires the operator to restore the existing authenticated session in the Command Center before another discovery run.
+
+On the subsequent operator-requested continuation, the local backend again reported no active authenticated page. The existing-only `/api/browser/reconnect` action was attempted (its code path forbids launching a replacement browser). A follow-up status check still returned `idle`, `active: false`, `authenticated: false`, with “No active controlled browser. Inspection requires an existing authenticated session.” No login, MFA, record navigation or form interaction was attempted. No additional selectors were verified; the session visible to the operator is not currently available through this backend's controlled page.

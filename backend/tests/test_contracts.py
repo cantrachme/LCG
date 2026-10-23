@@ -60,7 +60,7 @@ def pdf(text=SYNTHETIC_CONTRACT, *, pages=1, encrypted=False):
 
 
 def upload(content, filename="training.pdf", content_type="application/pdf"):
-    return client.post("/api/contracts/extract", files={"file": (filename, content, content_type)})
+    return client.post("/api/contracts/extract", headers={"X-LCG-Local": "1"}, files={"file": (filename, content, content_type)})
 
 
 def test_extracts_original_and_normalized_contract():
@@ -185,7 +185,7 @@ def test_rejects_unsupported_documents(kind):
 
 
 def test_requires_file_and_accepts_generic_binary_pdf():
-    assert client.post("/api/contracts/extract").status_code == 422
+    assert client.post("/api/contracts/extract", headers={"X-LCG-Local": "1"}).status_code == 422
     assert upload(pdf(), "TRAINING.PDF", "application/octet-stream").status_code == 200
 
 

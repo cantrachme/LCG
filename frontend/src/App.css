@@ -194,3 +194,22 @@ main { max-width: 1600px; margin: 0 auto; padding: 34px 40px 20px; }
   .review-sections { max-height: none; overflow: visible; padding-right: 0; }
   .browser-panel { position: static; min-height: 0; }
 }
+
+.inspection-progress, .inspection-result { font-size: 12px; line-height: 1.6; border-top: 1px solid #dfe5eb; padding-top: 15px; }
+.inspection-progress h3, .inspection-result h3 { font-size: 15px; margin-bottom: 10px; }
+.inspection-progress ol { max-height: 180px; overflow: auto; padding-left: 22px; }
+.inspection-progress time { color: #657587; font-size: 10px; }
+.inspection-result dl { margin: 12px 0; }
+.inspection-result dl > div { display: grid; grid-template-columns: minmax(90px, .7fr) minmax(0, 1.3fr); gap: 10px; padding: 4px 0; }
+.inspection-result dd { margin: 0; overflow-wrap: anywhere; }
+.inspection-result dt { color: #657587; text-transform: capitalize; }
+.inspection-result summary { cursor: pointer; padding: 8px 0; }
+.comparison-scroll { overflow-x: auto; max-height: 650px; }
+.comparison-table { border-collapse: collapse; min-width: 540px; width: 100%; font-size: 11px; }
+.comparison-table caption { text-align: left; padding: 12px 0; color: #657587; }
+.comparison-table td, .comparison-table th { text-align: left; vertical-align: top; padding: 9px; border: 1px solid #dfe5eb; overflow-wrap: anywhere; }
+.comparison-table th { text-transform: capitalize; }
+.comparison-table small { display: block; color: #657587; font-size: 9px; margin-top: 6px; }
+.comparison-different { background: #fff5e7; }
+.comparison-missing { background: #fff2ee; }
+.comparison-matching { background: #f2f9f4; }

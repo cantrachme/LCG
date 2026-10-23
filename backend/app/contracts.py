@@ -108,6 +108,7 @@ class ExtractionWarning(BaseModel):
 
 
 class ContractExtraction(BaseModel):
+    extraction_id: str | None = None
     page_count: int
     original: OriginalContract
     warnings: list[ExtractionWarning]

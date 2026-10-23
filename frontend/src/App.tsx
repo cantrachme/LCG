@@ -12,7 +12,8 @@ type ExtractedField = {
   status: 'extracted' | 'missing' | 'needs_review'
   source_page: number | null
 }
-type ContractExtraction = {
+export type ContractExtraction = {
+  extraction_id: string | null
   page_count: number
   original: Record<string, Record<string, ExtractedField>>
   warnings: { code: string; message: string }[]
@@ -66,7 +67,7 @@ function App() {
     form.append('file', selectedFile)
     try {
       const response = await fetch('http://127.0.0.1:8000/api/contracts/extract', {
-        method: 'POST', body: form, signal: controller.signal,
+        method: 'POST', headers: { 'X-LCG-Local': '1' }, body: form, signal: controller.signal,
       })
       if (!response.ok) {
         const error = await response.json().catch(() => null)
@@ -240,7 +241,7 @@ function App() {
               {extraction && (
                 <section className="contract-review" aria-labelledby="review-title">
                   <h3 id="review-title">Original contract review</h3>
-                  <p className="review-description">{selectedFile?.name} · {extraction.page_count} {extraction.page_count === 1 ? 'page' : 'pages'}. Expand each section to compare normalized values with the source. Values are read-only.</p>
+                  <p className="review-description">{selectedFile?.name ?? 'Restored PDF extraction'} · {extraction.page_count} {extraction.page_count === 1 ? 'page' : 'pages'}. Expand each section to compare normalized values with the source. Values are read-only.</p>
                   {extraction.warnings.length > 0 && (
                     <div className="review-warnings">
                       <h4>Review notes</h4>
@@ -280,7 +281,7 @@ function App() {
             </div>
           </section>
 
-          <BrowserWorkspace />
+          <BrowserWorkspace extraction={extraction} onRestore={(stored) => setExtraction((current) => current ?? stored)} />
         </div>
         <footer className="workspace-footer">
           <span>Built around your workflow. Guided by you.</span>

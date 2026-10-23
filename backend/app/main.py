@@ -1,19 +1,18 @@
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
 from .contracts import MAX_FILE_BYTES, ContractExtraction, ExtractionError, extract_contract
-from .browser import router as browser_router, session
+from .browser import local_request, router as browser_router, session
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
-    async with session.lock:
-        await session.close()
+    await session.shutdown()
 
 app = FastAPI(
     title="LCG Command Center API",
@@ -33,6 +32,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
+    expose_headers=["X-LCG-Captured-At"],
 )
 
 
@@ -44,7 +44,7 @@ async def health_check():
     }
 
 
-@app.post("/api/contracts/extract", response_model=ContractExtraction)
+@app.post("/api/contracts/extract", response_model=ContractExtraction, dependencies=[Depends(local_request)])
 async def extract_uploaded_contract(response: Response, file: UploadFile = File(...)):
     response.headers["Cache-Control"] = "no-store"
     try:
@@ -58,7 +58,7 @@ async def extract_uploaded_contract(response: Response, file: UploadFile = File(
         if not content:
             raise HTTPException(status_code=400, detail="The uploaded PDF is empty. Choose a non-empty PDF.")
         try:
-            return await run_in_threadpool(extract_contract, content)
+            return session.set_document(await run_in_threadpool(extract_contract, content))
         except ExtractionError as error:
             raise HTTPException(status_code=422, detail=str(error)) from None
     finally:

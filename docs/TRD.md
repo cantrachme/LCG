@@ -1,8 +1,8 @@
 # LCG Command Center — Technical Requirements Document (TRD)
 
-**Version:** 0.2 (local browser implementation and verified LCW discovery)  
-**Date:** 2026-10-22  
-**Status:** Local read-only foundation implemented; authenticated integration checks partly pending  
+**Version:** 0.3 (owned persistent browser and autonomous read-only inspection)  
+**Date:** 2026-10-23  
+**Status:** Read-only workflow implemented and offline-tested; real acceptance blocked by unavailable authenticated controlled session  
 **Current runtime:** Local React + FastAPI + headed Chromium; Azure is future work
 
 ## 1. Engineering decision summary
@@ -32,7 +32,7 @@ flowchart LR
   CHR --> LCW[Actual LCW preproduction]
 ```
 
-One backend worker, one dedicated profile, one controlled page. The existing extraction endpoint processes uploads in memory; no database or workflow runner is involved. Native operator input is outside the API lock, so the application cannot prevent manual LCW edits in that window; implemented agent actions remain read-only after sign-in.
+One backend worker, one OS-locked dedicated profile, one exact controlled page. Chromium is a detached local process; Playwright attaches to its existing default persistent context through loopback-only CDP. API shutdown disconnects automation while retaining the browser, and explicit reconnect resolves the recorded process/target without navigating or logging in. This requires no remote-browser service. The existing extraction endpoint processes uploads in memory; no database or workflow runner is involved. Native operator input is outside the API lock, so the application cannot prevent manual LCW edits in that window; implemented agent actions remain read-only after sign-in.
 
 ### Future hosted architecture — proposal only
 
@@ -60,7 +60,7 @@ flowchart LR
 
 The browser workspace fetches a `page.screenshot(type='jpeg')` frame approximately every 1.5 seconds while visible. Frames are returned with `Cache-Control: no-store` and are not written to disk. Microsoft sign-in and unrecognized pages suppress the preview. This is a low-frame-rate page preview; it does not include browser chrome or accept React mouse/key input. Post-MFA preview integration has not been verified.
 
-**Take control locally** sets human ownership under the shared lock and brings the controlled page forward. Sign-in automation refuses to act while human ownership is active. **Return control** re-observes the page; MFA forces human ownership again. Native-window takeover is implemented; authenticated end-to-end verification remains pending.
+**Take control locally** sets human ownership under the shared lock and brings the controlled page forward. Sign-in automation refuses to act while human ownership is active. **Return control** re-observes the page; MFA forces human ownership again. Takeover requests do not wait for the full background inspection: an epoch/event pauses at the next bounded operation, with a 12-second operation limit. Return Control rechecks authentication and restarts from identity search. Stop Inspection cancels automation and retains the PDF/browser. Authenticated real end-to-end takeover remains pending; interruption/resume/cancel is tested offline.
 
 For future in-panel interaction, investigate Chromium CDP `Page.startScreencast`, frame acknowledgments and validated mouse/key events targeting the same page. Add a server-held human-control lease, coordinate scaling, session binding and re-observation before agent dispatch resumes. Do not expose debugging ports or arbitrary CDP commands. This is an investigation, not implemented functionality.
 
@@ -93,6 +93,7 @@ LCG/
       main.py
       contracts.py
       browser.py
+      inspection.py
     tests/
       test_health.py
       test_contracts.py
@@ -129,10 +130,10 @@ Only essential browser implementation, UI, tests and discovery documentation wer
 
 ### Module 4 — Current browser foundation and future workflow
 
-- **Implemented:** local session manager, observed Microsoft sign-in steps, manual MFA pause, same-page JPEG preview, local ownership controls, sanitized errors and fixed profile reuse.
+- **Implemented:** a process-owned local Chromium/profile, serialized/idempotent lifecycle, explicit authentication only, same-page preview, background inspection, ID-based child verification, contract/PRA list parsing, field comparison, takeover/resume/cancel and UI reconnection. Pure parsing/comparison lives in `inspection.py`.
 - **Verified interactively on real preproduction:** headed launch, login with manual MFA, home/search navigation, child/family/center identity, existing assignment/PRA row and contract list. No record writes.
 - **Pending:** authenticated preview/takeover integration and authenticated reuse after restart. Further MFA testing was declined by the operator; do not launch extra test browsers.
-- **Later iteration:** expose validated read-only child/record inspection as application actions before adding field entry, approval gates or save verification. No add/edit/copy/save action is permitted in this iteration.
+- **Read-only workflow:** server-retained extraction ID → existing authenticated session → observed alphabetic search → child/family/center verification → existing assignment and contract lists → deterministic comparison. Synthetic PDF-to-result orchestration is tested; real Camila acceptance is pending. Field entry, approvals and saves remain future work; no add/edit/copy/save action is permitted.
 - **Exit for current scope:** document actual observations and boundaries; pass offline checks. This does not imply the full contract workflow has passed.
 
 ### Module 5 — Security, testing and Azure
@@ -149,14 +150,20 @@ Current constraints: keep the implementation minimal; reuse the existing app; no
 ### Implemented session behavior
 
 - Read `LCW_URL`, `LCW_USERNAME`, `LCW_PASSWORD` from existing `backend/.env`; never hardcode or log credentials. The URL must be HTTPS without embedded credentials, query or fragment.
-- Launch with `chromium.launch_persistent_context`, `headless=False`, using fixed `backend/.lcw-browser-profile/`. Create the profile with owner-only permissions and exclude it from version control. It contains sensitive auth/browser data; do not share it.
+- Launch the Playwright-installed Chromium executable headed, with fixed `--user-data-dir=backend/.lcw-browser-profile/`, as a detached local process; connect via `chromium.connect_over_cdp` to its private loopback endpoint. This preserves the open browser through API shutdown. Use one existing default context, never `new_context` or a temporary profile. An OS advisory owner lock prevents multiple backends from claiming it; Chromium profile locks are respected. Private process/target metadata stays inside the ignored, owner-only profile.
 - Reuse the active context/page without navigating away on repeated starts. Reopen the same profile after a graceful close/restart. If another process owns the profile, report failure; do not silently create a fresh profile.
 - Initial dedicated-profile sign-in may still be required. Existing session cookies and Microsoft/LCW policy determine later authentication. Closing the browser retains its profile; it does not sign out. Cross-restart authenticated reuse is untested.
-- One backend worker without reload; serialize browser access through one `asyncio.Lock`. No extra authenticated test sessions and no automatic credential retries while MFA is pending.
-- Login uses observed `#i0116` / `Next`, `#i0118` / `Sign in`; password submission is limited to one attempt per launched session. The observed `Approve sign in request` heading pauses for the operator. Other prompts, including `Stay signed in?`, remain manual.
+- One backend worker without reload. Serialize navigation/start with `asyncio.Lock`; use a separate frame lock for deduplicated same-page captures. Inspection is one server-owned background task with an immutable source snapshot, idempotent request handling and bounded operations. Takeover changes ownership immediately; no next action may dispatch after that boundary. No extra authenticated test sessions or automatic credential retries.
+- Login uses observed `#i0116` / `Next`, `#i0118` / `Sign in`, only after an explicit login action; its attempt flag is retained in private process metadata. Status/upload/Inspect/reconnect never submit credentials. The observed `Approve sign in request` heading pauses for the operator. Other prompts, including `Stay signed in?`, remain manual.
 - Recognize authenticated LCW using the configured origin plus observed `#userProfileMenu` and navigation link `Family`. Authentication does not verify a child record.
 - Navigation errors/timeouts, closed pages, unfamiliar pages and return to Microsoft sign-in are surfaced with fixed messages. No raw exception text, URL queries, cookies, tokens or DOM are returned by the session API. Automated recovery of arbitrary portal/session-expiry screens is not verified.
-- Current states: `closed`, `waiting_for_login`, `waiting_for_mfa`, `waiting_for_user`, `portal_unverified`, `authenticated`, `navigation_error`, `unexpected_page`.
+- Current browser/job states: `idle`, `authenticated`, `awaiting_authentication`, `awaiting_mfa`, `inspecting`, `paused`, `failed`, `cancelled`, `completed`. An inspection may complete with unverified fields; that is not evidence of contract setup or complete compatibility.
+
+### Implemented parsing and comparison boundary
+
+`inspection.py` validates identifiers from the server-retained PDF extraction, parses actual observed link targets/rows and compares normalized source values against portal evidence. It does not hardcode sample record IDs. All existing contracts/assignments are returned; a unique exact source match may be selected, while ambiguous matches remain unverified. Child detail requires child ID, family ID, center and name. Assignment reads recheck child/family context; contract lists require the exact child-specific heading.
+
+Read-only record lists expose contract ID/agency/dates and assignment classroom/dates/displayed rate description. Unit prices/copays, reimbursement settings, program and detailed schedule remain Not verified because no safe read-only detail controls have been observed. Do not infer them from tuition or a rate label. Empty/unreadable rows remain Not verified until an actual empty-state selector is established; never infer absence from another table. Matching/Different/Missing/Not verified results preserve source text/page, observed value/evidence and a null future-approved-change field. PRA coverage is a date comparison, not full reuse authorization.
 
 ### Future workflow tools — not implemented
 
@@ -219,8 +226,13 @@ LLM responses are **proposals**: schema-validate every value, cross-check agains
 | Method | Route | Behavior |
 |---|---|---|
 | GET | `/api/health` | Backend health |
-| POST | `/api/contracts/extract` | In-memory PDF extraction; 5 MB / 10 page limits; source-aware result |
-| POST | `/api/browser/start` | Open/reuse dedicated local headed Chromium context/page |
+| POST | `/api/contracts/extract` | Guarded local in-memory PDF extraction; 5 MB / 10 page limits; source-aware result and opaque extraction ID |
+| POST | `/api/browser/start` | Explicitly open/reuse the owned headed browser; same fixed profile and exact target |
+| POST | `/api/browser/reconnect` | Attach to the already owned local process only; never launch/navigate/login |
+| POST | `/api/browser/inspect` | Extraction ID + idempotency request ID; require already authenticated session; start/reuse one read-only job |
+| GET | `/api/browser/inspection` | Current job, immutable source, observed records and comparison; survives frontend refresh |
+| GET | `/api/browser/document` | Latest in-memory extraction for UI restoration |
+| POST | `/api/browser/cancel-inspection` | Stop automation while retaining browser/profile/document |
 | POST | `/api/browser/login` | Observed credential steps only; pause for manual challenges |
 | POST | `/api/browser/take-control` | Set human ownership and focus the controlled page |
 | POST | `/api/browser/return-control` | Set agent ownership, then re-observe; MFA retains human ownership |
@@ -229,7 +241,7 @@ LLM responses are **proposals**: schema-validate every value, cross-check agains
 | GET | `/api/browser/frame` | Actual controlled-page JPEG; no-store; suppressed during sign-in/unrecognized pages |
 | GET | `/api/browser/navigation` | Visible link labels only; no clicks or record verification |
 
-Browser routes require a loopback client/host, `X-LCG-Local: 1`, and an allowed frontend Origin when supplied (`http://localhost:5173` or `http://127.0.0.1:5173`). This local request guard is not a production operator-authentication system. No generic URL/click/script/input, record-edit or save routes exist.
+Browser routes and extraction require a loopback client/host, `X-LCG-Local: 1`, and an allowed frontend Origin when supplied (`http://localhost:5173` or `http://127.0.0.1:5173`). This local request guard is not a production operator-authentication system. No generic URL/click/script/input, record-edit, save or CDP routes exist. Raw cookies/tokens/storage and internal process/CDP metadata are never returned. Frames remain in memory, include an actual capture timestamp, and are discarded when navigation changes page/authentication during capture.
 
 ### Future versioned workflow API — proposal only
 
@@ -253,7 +265,7 @@ For the future versioned API, every authenticated route must enforce operator sc
 
 ## 8. Storage and consistency
 
-The current app has no database. It retains browser authentication data only in the dedicated local profile; uploaded PDFs and preview frames are not saved by the application. Browser profile/cache contents remain sensitive runtime data. The following PostgreSQL entities are future proposals:
+The current app has no database. The latest validated extraction and one job/result are retained in process memory; a UI refresh restores them without restarting execution. A backend restart retains Chromium but loses PDF/job memory; upload and explicitly inspect again after reconnecting. It retains browser authentication data only in the dedicated local profile; uploaded PDFs and preview frames are not saved by the application. Browser profile/cache contents remain sensitive runtime data. The following PostgreSQL entities are future proposals:
 
 - `users` / `operator_roles`: principal identifier, permissions.
 - `documents`: upload metadata, blob object reference, classification, retention/deletion status.
@@ -339,9 +351,9 @@ npm run build
 npm run lint
 ```
 
-On 2026-10-22 all **33 backend tests**, frontend production build and lint passed. Backend tests use synthetic data/mocked browser objects and do not contact LCW or trigger MFA. They cover extraction/health, local route restrictions, rejection of record writes, active-page reuse, a stable persistent-profile path, manual-control blocking, prevention of password retries, redaction and timeout handling. Existing PyMuPDF SWIG deprecation warnings were emitted.
+On 2026-10-23 all **70 backend tests**, TypeScript checks, frontend production build and lint passed. Backend tests use synthetic data/mocked browser objects and do not contact LCW or trigger MFA. They cover extraction/health, route restrictions, no record writes, fixed-profile cold/concurrent starts, cross-owner locking, exact-target CDP reconnect, preserved browser on shutdown, no automatic/repeated login, synthetic PDF-to-comparison orchestration, mismatched/ambiguous identities and records, source immutability, expiry, takeover/resume/cancel, refresh during an active run, sanitized failures and frame capture/deduplication. Existing PyMuPDF SWIG deprecation warnings were emitted.
 
-Real integrated FastAPI launch/login reached MFA. Post-MFA preview/takeover and cross-restart authenticated profile reuse remain pending because the operator declined another MFA test. No new login is requested for validation now. The broader testing matrix in section 10 describes later workflow/deployment checks, not completed tests.
+Historical integrated FastAPI launch/login reached MFA on 2026-10-22. The existing backend reported no controlled browser on 2026-10-23; no new browser, portal navigation, login or MFA was initiated. The new detached-process/CDP lifecycle has only mocked verification so far. Post-MFA preview/takeover and cross-restart authenticated profile reuse remain pending because the operator declined another MFA test. No new login is requested for validation now. The broader testing matrix in section 10 describes later workflow/deployment checks, not completed tests.
 
 ## 12. Verified discovery and unresolved decisions
 
@@ -362,14 +374,14 @@ Target: `https://lcw2-preprod.learningcaregroup.com/center/daycare.do`, read fro
 
 Dynamic `sm-…` menu IDs changed and must not be hardcoded. A CSS text selector for the search icon timed out; its accessible-role selector worked. Clicking the top Search textbox alone did not load results. Text search, Advanced Search, full search-result URL parameters, full PRA details, contract fields, unit prices/copays and save behavior were not tested. No selectors for those untested workflows may be treated as verified.
 
-No LCW record was created, modified, submitted or saved. Child/family/PRA/contract inspection above is interactive discovery evidence; these are not automatic application actions yet. Detailed observations and limitations are in [LCW browser discovery](LCW_BROWSER_DISCOVERY.md).
+No LCW record was created, modified, submitted or saved. Child/family/PRA/contract inspection above is historical interactive evidence. The new autonomous application actions use those observed controls but have not been exercised against live LCW. Detailed observations and limitations are in [LCW browser discovery](LCW_BROWSER_DISCOVERY.md).
 
 **Current decisions:** existing React/FastAPI/PyMuPDF, local Python Playwright, one dedicated persistent profile, actual preproduction, read-only agent actions after login, same-page preview and local human control. Extra services, agents, databases and remote-browser infrastructure are deferred.
 
 **Still to validate:**
 
 - Authenticated preview/takeover integration and profile reuse after restart, when the operator is ready; no additional MFA tests now.
-- Reproducible read-only child/record application actions using observed navigation and all identifiers.
+- Real Camila PDF → autonomous search/identity → contract/PRA inspection → field comparison → displayed results. This is implemented and tested synthetically but remains the live acceptance blocker.
 - Full contract field map, PRA schedule/rate compatibility and reconciliation of existing contract 1833773 before any future write.
 - Approval binding, duplicate prevention and saved-state verification in a separately authorized iteration.
 - Future operator authentication, profile retention/deletion, tenant isolation and deployment/security requirements.
@@ -398,4 +410,4 @@ No LCW record was created, modified, submitted or saved. Child/family/PRA/contra
 
 ---
 
-**Evidence boundary:** actual LCW read-only access, identity and existing-record discovery were verified on 2026-10-22. Integrated authenticated preview/takeover, cross-restart authentication reuse, full field mapping and writes remain unverified. Original PDF/video facts are carried forward from earlier project context; those original attachments were not freshly inspected in this iteration. No end-to-end contract-creation success is claimed.
+**Evidence boundary:** historical LCW read-only access, identity and existing-record discovery were verified on 2026-10-22. New autonomous implementation verification on 2026-10-23 is offline only, because no controlled authenticated session was available and new login/MFA is not authorized. Integrated authenticated preview/takeover, cross-restart authentication reuse, full field mapping and writes remain unverified. Original PDF/video facts are carried forward from earlier project context; those original attachments were not freshly inspected in this iteration. No end-to-end contract-creation success is claimed.

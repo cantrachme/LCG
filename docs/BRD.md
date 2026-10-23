@@ -1,8 +1,8 @@
 # LCG Command Center — Business Requirements Document (BRD)
 
-**Version:** 0.2 (verified LCW discovery and session reuse)  
-**Date:** 2026-10-22  
-**Status:** Read-only preproduction discovery verified; future write workflow requires approval and validation  
+**Version:** 0.3 (autonomous read-only inspection and authentication continuity)  
+**Date:** 2026-10-23  
+**Status:** Read-only automation implemented/offline-tested; real end-to-end acceptance pending; writes excluded  
 **Project:** LCG — Learning Care Group Command Center  
 **Initial use case:** Camila sample child-care subsidy contract setup on LCW
 
@@ -46,7 +46,7 @@ The current iteration uses actual LCW preproduction through local headed Chromiu
 
 ## 5. In-scope business capabilities (first release)
 
-The following list is the intended first release, not a completion report. Current delivery comprises extraction/source review and the local browser foundation. Interactive discovery verified the existing child/family and record lists; automatic lookup, editing, approvals and saved-result verification remain future application capabilities.
+The following list is the intended first release, not a completion report. Current delivery comprises extraction/source review, a single owned persistent Chromium session, autonomous ID-based child lookup, existing contract/PRA list inspection and source-to-portal comparison. A synthetic PDF-to-comparison test exercises the workflow offline. The actual Camila acceptance flow remains unverified; editing, approvals and saved-result verification remain future capabilities.
 
 1. Upload an authorized sample contract PDF.
 2. Extract and present structured contract details with original-source provenance.
@@ -84,7 +84,7 @@ Microsoft sign-in and operator-completed MFA led to the authenticated LCW portal
 
 LCW already showed an active School Age 2 assignment dated **2026-08-08 to 2026-11-20**, matching the sample's PRA period, and an existing third-party contract with **CA - ST Riverside County Office of Ed**, dates **2026-09-28 to 2026-10-02**, contract ID **1833773**. Full PRA compatibility and contract/rate/copay correctness were not verified. The next contract workflow must inspect and reconcile these records before proposing any creation, amendment or reuse. No LCW record was changed or saved.
 
-The live preview and takeover were implemented but authenticated integration verification was left pending at the operator's request. A second isolated test browser caused another MFA prompt and was closed. The app now uses a fixed local profile; reuse after authenticated restart remains untested and may need an initial sign-in when the operator is ready. Do not trigger further MFA for tests without renewed operator direction. See [LCW browser discovery](LCW_BROWSER_DISCOVERY.md).
+The live preview and takeover were implemented but authenticated integration verification was left pending at the operator's request. A second isolated test browser caused another MFA prompt and was closed. The app now retains its single local Chromium process across API shutdown, reconnects to the exact owned tab and reuses its fixed profile. These lifecycle guarantees are offline-tested; real restart/authentication behavior remains unverified. No active controlled session was available on 2026-10-23, and no new browser/login/MFA was initiated. Do not trigger further MFA for tests without renewed operator direction. See [LCW browser discovery](LCW_BROWSER_DISCOVERY.md).
 
 ## 8. Business rules and controls
 
@@ -140,9 +140,9 @@ For the current iteration, do not install dependencies, create environment files
 
 Business acceptance requires: a visible source-to-LCW mapping; a verified existing family/child; an appropriate existing-PRA branch; operator-controlled sign-in and final write approval; a saved-result receipt or explicit failure; and a demonstrable end-to-end run on authorized test data.
 
-That is future full-release acceptance. Current evidence establishes real read-only access and identity/existing-record discovery. The local foundation passed 33 backend tests plus frontend build/lint; these checks do not prove authenticated profile reuse, live-preview/takeover integration or a completed contract setup.
+That is future full-release acceptance. Historical evidence establishes real read-only access and identity/existing-record discovery. Current automation reports observed values separately from PDF values using Matching, Different, Missing and Not verified; unknown unit prices/copays/program/schedule details cannot be presented as matches. Multiple/ambiguous records require review, and an unreadable table must not be treated as confirmed absence. Module 4 passed 70 backend tests, TypeScript and frontend build/lint; these checks do not prove authenticated profile reuse, live-preview/takeover integration or a completed contract setup.
 
-**Resolved by observation:** configured preproduction access, Microsoft sign-in, Camila's identity and the presence of an existing assignment/contract. **Still requiring validation or decision:** full contract field map; compatibility/reconciliation of existing records; PRA coverage of any proposed extension; approval boundaries; who may access submitted files and retained browser profiles; cloud region and rollout; business success measures. No further login/MFA test is requested now.
+**Resolved by observation:** configured preproduction access, Microsoft sign-in, Camila's identity and the presence of an existing assignment/contract. **Still requiring validation or decision:** autonomous real Camila upload-to-comparison acceptance and actual browser persistence; full contract field map; compatibility/reconciliation of existing records; PRA coverage of any proposed extension; approval boundaries; who may access submitted files and retained browser profiles; cloud region and rollout; business success measures. No further login/MFA test is requested now.
 
 ---
 

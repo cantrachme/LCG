@@ -1,8 +1,8 @@
 # LCG Command Center — Product Requirements Document (PRD)
 
-**Version:** 0.2 (real LCW discovery and local session foundation)  
-**Date:** 2026-10-22  
-**Status:** Read-only preproduction exploration verified; full contract workflow remains planned  
+**Version:** 0.3 (persistent browser lifecycle and autonomous read-only inspection)  
+**Date:** 2026-10-23  
+**Status:** Module 4 implemented and offline-tested; autonomous live acceptance remains blocked by unavailable authenticated access  
 **Primary persona:** School director / authorized admissions operator
 
 ## 1. Product summary
@@ -15,7 +15,7 @@ This is a **contract-setup** initial release, not a general-purpose family-enrol
 
 The current iteration establishes a real, local LCW browser session using the existing FastAPI backend, React frontend and Python Playwright with headed Chromium. Exploration after login is read-only. Contract creation, field changes, submission and saving are outside this iteration. No mock portal, additional services, databases or agents are required.
 
-The application implements PDF extraction with source review, browser launch/sign-in controls, a same-page JPEG preview and local takeover controls. Source review is currently read-only; chat, field overrides, workflow orchestration, automatic child lookup and contract/PRA actions remain planned. The preview and takeover have not been verified end to end after authenticated login.
+The application implements PDF extraction/source review, persistent browser ownership, explicit reconnect/sign-in controls, autonomous child identification, existing contract/PRA list inspection, deterministic comparison, genuine progress and interruptible local takeover. Source review is read-only. Chat, overrides and contract/PRA changes remain future work. The new autonomous flow, browser lifecycle and authenticated preview/takeover are offline-tested only; no authenticated controlled session was available for live verification on 2026-10-23.
 
 On 2026-10-22, interactive Python Playwright exploration of actual LCW preproduction verified Microsoft sign-in with operator-completed MFA, authenticated navigation, Camila's child/family/center identifiers, an existing PRA assignment and an existing contract. These browser findings are discovery evidence, not completed application workflow steps. The original PDF and reference video were not available for fresh inspection in this iteration; their requirements are carried forward from the project brief and earlier documents. See [LCW browser discovery](LCW_BROWSER_DISCOVERY.md) for observed screens and selectors.
 
@@ -46,11 +46,11 @@ Desktop layout (responsive but desktop-first for this prototype):
 
 The layout above describes the target experience. The current React workspace displays JPEG images from the exact page Playwright controls, refreshed approximately every 1.5 seconds. Sign-in and unrecognized pages suppress the preview. **Take control locally** pauses sign-in automation and focuses that same native Chromium window; the React image does not accept mouse or keyboard input. In-panel interaction and a secured hosted viewer are future work. The operator and agent must use **one authoritative browser session**.
 
-Reuse one dedicated local LCW profile across actions and application restarts. Repeated start requests must reuse the open page. Do not create extra browsers for testing or automatically retry credentials while MFA is pending. Closing the browser retains its profile and does not sign the operator out. Microsoft/LCW may still expire or revoke authentication; persistent sign-in must not be described as eliminating MFA. The new dedicated profile may require an initial sign-in when the operator is ready; authenticated reuse across restarts remains unverified. Further MFA testing is paused at the operator's request.
+Reuse one dedicated local LCW profile across actions and application restarts. Repeated start requests must reuse the open page. Do not create extra browsers for testing or automatically retry credentials while MFA is pending. Closing the browser retains its profile and does not sign the operator out. Microsoft/LCW may still expire or revoke authentication; persistent sign-in must not be described as eliminating MFA. Backend shutdown detaches automation while retaining the locally owned Chromium process and exact target tab; explicit reconnect reuses it. A profile/ownership conflict must stop without launching a fallback. Browser launch and login are separate explicit actions. Status, uploads, UI refresh and Inspect must never trigger login. Authenticated reuse across restarts remains unverified; no new login/MFA is authorized for implementation testing.
 
 ## 3. End-to-end user journey
 
-This is the target journey. Only the read-only foundation and discovery described above are delivered in this iteration; steps involving changes or saves require a later explicitly approved iteration.
+This is the target journey. The read-only inspection workflow described above is implemented and tested with synthetic data; live end-to-end acceptance is still pending. The list below extends beyond this iteration; steps involving changes or saves require a later explicitly approved iteration.
 
 1. Open the Command Center, authenticate as an authorized operator, and create a run.
 2. Upload Camila's sample PDF; view file status and validation messages.
@@ -88,6 +88,9 @@ This is the target journey. Only the read-only foundation and discovery describe
 | FR-18 | P2 | Multi-operator concurrency | Isolated sessions per operator, subject to access and capacity testing. |
 | FR-19 | P0 | Reuse local authentication | Reuse the active session and fixed local profile; do not launch a fresh profile or trigger sign-in for each action/test. Pause when Microsoft/LCW requires renewed authentication. Cross-restart authenticated reuse must be verified before acceptance. |
 
+| FR-20 | P0 | Read-only PDF-to-LCW comparison | Inspect uses server-retained extraction values and the existing authenticated page; verifies child/family/center, reports existing records and compares fields with Matching/Different/Missing/Not verified plus source and portal evidence. Unknown details must remain unverified. |
+| FR-21 | P0 | Interrupt and reconnect | Take Control pauses at bounded operation boundaries; Return Control re-observes and repeats identity verification. Refresh retrieves the existing job; duplicate Inspect requests cannot create another run. |
+
 P0 = needed for an end-to-end controlled demonstration. The order of delivery follows the five modules, so P0 capabilities can be completed across modules.
 
 ## 5. Workflow states
@@ -118,7 +121,7 @@ stateDiagram-v2
 
 **Invariant:** no write while waiting for human input, user takeover, approval, or unresolved write status. A run can have multiple approval/verification cycles (contract and, if required, PRA).
 
-This state diagram is a future workflow model. The current browser API reports local session states such as `closed`, `waiting_for_login`, `waiting_for_mfa`, `waiting_for_user`, `authenticated`, `portal_unverified`, `navigation_error` and `unexpected_page`; it does not implement contract-run states or save approval.
+This state diagram is a future workflow model. The current browser/inspection API reports `idle`, `authenticated`, `awaiting_authentication`, `awaiting_mfa`, `inspecting`, `paused`, `failed`, `cancelled` and `completed`. Comparison completion does not verify unobserved fields or imply any save. Contract-run approvals/writes remain future work.
 
 ## 6. Data model: minimum extracted contract fields
 
@@ -179,7 +182,7 @@ The sample requires reuse of an existing PRA, while the video creates a new one.
 - [ ] Authorized real LCW read-only navigation can be reproduced through application actions, with evidence and no record changes.
 - [ ] Reopening the dedicated local profile reuses authentication when Microsoft/LCW permits it; no extra test browser prompts for MFA.
 
-These are release acceptance checks, not a statement that the full workflow has passed. Real interactive read-only discovery succeeded; integrated post-MFA preview/takeover and cross-restart authenticated reuse remain pending. The existing 33 backend tests, frontend build and lint passed; they do not establish end-to-end LCW workflow completion.
+These are release acceptance checks, not a statement that the full workflow has passed. Historical interactive discovery succeeded. The autonomous workflow is tested with synthetic records; actual Camila PDF → Inspect → contract/PRA → comparison acceptance, authenticated preview/takeover and cross-restart authentication reuse remain pending. The latest Module 4 check passed 70 backend tests, TypeScript, frontend build and lint; they do not establish end-to-end LCW workflow completion.
 
 ## 10. Release and dependency plan
 
@@ -191,7 +194,7 @@ These are release acceptance checks, not a statement that the full workflow has 
 | 4. Browser | Live browser, authorized LCW interaction, manual takeover and verification. |
 | 5. Deployment | Security/test hardening, containerization, Azure deployment and runbook. |
 
-**Verified:** actual preproduction launch, Microsoft login with manual MFA, authenticated read-only navigation, identity match, existing PRA assignment and contract list. **Not yet verified:** full field mapping, rates/copays, integrated post-MFA preview/takeover, authenticated reuse across restarts, save behavior and deployment/security approvals. Establish reliable local execution before adding remote-browser infrastructure. This iteration must not install dependencies, create environment files or execute Git operations.
+**Verified:** actual preproduction launch, Microsoft login with manual MFA, authenticated read-only navigation, identity match, existing PRA assignment and contract list. **Not yet verified:** new lifecycle with actual Chromium, autonomous real-portal navigation/parsing and original-PDF acceptance, full field mapping, rates/copays, authenticated preview/takeover, authentication across restarts, save behavior and deployment/security approvals. No LCW login/MFA was initiated on 2026-10-23. Establish reliable local execution before adding remote-browser infrastructure. This iteration must not install dependencies, create environment files or execute Git operations.
 
 ---
 

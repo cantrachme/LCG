@@ -1,8 +1,8 @@
-# LCW local browser integration — 2026-10-22
+# LCW browser integration — Module 4 update, 2026-10-23
 
 This iteration supersedes the earlier mock-first guidance in PRD/BRD/TRD for the explicitly authorized real preproduction exploration. No dependencies, environment files, databases, agents, remote browser services or Git operations were added/run.
 
-## Verified real exploration
+## Historical real exploration — 2026-10-22
 
 Python Playwright launched headed Chromium and opened the `LCW_URL` from `backend/.env`: `https://lcw2-preprod.learningcaregroup.com/center/daycare.do`. Microsoft sign-in redirected through `login.microsoftonline.com`. The configured username and password were submitted, then automation stopped at **Approve sign in request**. The operator completed MFA. At **Stay signed in?**, **No** was selected in this initial temporary exploration session. Authentication succeeded and the actual LCW home screen loaded.
 
@@ -48,43 +48,71 @@ The Third Party Contract List already contained:
 
 Neither edit nor copy nor add was clicked. The matching agency/dates require reconciliation before any future creation. Contract contents, unit prices, copays, and persisted field correctness have not been verified. No contract or PRA was created, modified, submitted or saved in this exploration. No personal, financial or schedule form input was changed.
 
-## Implemented foundation
+## Module 4 implementation — 2026-10-23
 
-`backend/app/browser.py` adds one local session to the existing FastAPI app. Configuration is read from `backend/.env` using `LCW_URL`, `LCW_USERNAME`, and `LCW_PASSWORD`. Browser exceptions are replaced with fixed messages. No raw DOM, tokens, credentials or URL queries are returned by the API. Local browser routes require a loopback client/host and `X-LCG-Local: 1`; browser origins are restricted to the two existing development UI origins.
+The existing backend reported no active controlled browser during the status-only check on 2026-10-23. **No new Chromium, LCW login or MFA was initiated.** The historical observations above guide navigation; they are not fresh live verification of the new autonomous workflow. The original Camila PDF was unavailable for a fresh end-to-end upload test. Automated verification used synthetic PDFs and mocked Playwright pages.
 
-- `POST /api/browser/start`: open/reuse the dedicated headed Chromium context and page. Repeated starts retain the active page rather than relaunching or navigating away.
-- `POST /api/browser/login`: observed Microsoft username/password steps only; one password attempt per launched session. MFA and other prompts remain manual.
-- `POST /api/browser/take-control`: pause sign-in automation and focus the same local window.
-- `POST /api/browser/return-control`: re-observe before allowing sign-in automation. MFA still forces human ownership.
-- `POST /api/browser/close`: close Chromium gracefully; retain the dedicated profile.
-- `GET /api/browser/status`, `/frame`, `/navigation`: state, a real JPEG from the controlled page, and visible link labels. No generic click, arbitrary URL, script, record edit or save endpoints exist.
+### One persistent browser and explicit authentication
 
-Navigation timeouts, closed pages, unfamiliar pages and return to Microsoft sign-in are surfaced rather than reported as success. Authentication requires the configured LCW origin plus the observed profile/menu elements. Child identity is not inferred from authentication. Automated child lookup/verification and PRA/contract inspection are **not yet exposed as application actions**; the actual exploration above was performed interactively with Python Playwright.
+`backend/app/browser.py` now owns one local Chromium process using the fixed `backend/.lcw-browser-profile/`. An OS advisory lock prevents separate backends from claiming it concurrently; the in-process lock serializes start and browser actions. Chromium's existing profile lock is respected and never removed; no alternate or temporary profile is used.
 
-### Avoiding repeated MFA
+To preserve the open browser through backend shutdown, Chromium is launched as a detached local process using the Playwright-installed executable. Playwright attaches to its one default persistent context through loopback-only CDP. Private metadata inside the ignored profile records the process and exact controlled target. Reconnection verifies that process owns the configured profile and resolves the recorded target; it does not pick another tab or navigate an authenticated page. This is a local browser-lifecycle implementation, not a remote-browser service. CDP addresses and raw protocol access are not exposed through application APIs.
 
-The initial discovery and integrated testing used two isolated temporary contexts, which caused a second MFA prompt. The operator declined further MFA testing. That second browser was closed; the first authenticated exploration session was left intact.
+Routine API shutdown cancels automation and disconnects its transport; it does not close Chromium or log out. Only an explicit Close action issues a browser-close command. Neither close nor disconnect clears profile, cookies or local storage. Authentication reuse across real browser/backend restarts still needs live verification. Browser launch/attachment through the new local-process mechanism has only been exercised with mocks because another browser/session is not authorized for testing now.
 
-The implementation now uses `launch_persistent_context` with the fixed directory `backend/.lcw-browser-profile/`. It reuses the same context while running and the same profile after restart. The directory is excluded in `.gitignore` and created with owner-only access. It contains sensitive authentication/browser data; it is not an environment file and must not be shared or committed. Closing the browser is **not** signing out. No fresh-profile fallback is attempted if the profile is locked by another process. Run a single backend worker without auto-reload during a browser workflow.
+Status checks, uploads, UI reconnects and inspection retries never sign in. The **Reconnect existing browser** action can attach only to an already owned process; it never launches one. **Open dedicated browser** is a separate explicit action. **Sign in explicitly** is the only credential-submission action, with one attempt per browser lifetime, recorded in private metadata. An authenticated session returns without entering credentials. MFA/unknown sign-in requires the operator in the same native window. No login action was invoked for this implementation's tests.
 
-This change cannot retroactively turn the earlier temporary context into the dedicated profile. The dedicated profile may need an initial sign-in when the operator is ready. Do not open extra authenticated test browsers or automatically re-submit credentials while MFA is pending. Microsoft/LCW can still expire or revoke sessions, and session-only cookies may not survive browser closure. The operator decides any **Stay signed in?** prompt; the agent does not change MFA or identity-provider policies. Cross-restart authenticated reuse remains untested.
+### Autonomous read-only inspection
 
-## Minimum same-session visualization
+The backend retains the latest validated extraction in memory with an opaque extraction ID. The inspection request supplies that ID rather than editable identity fields. Each job holds an immutable source snapshot; another PDF upload cannot silently change its comparison. UI refresh retrieves the existing document and job; it does not restart or cancel browser execution. Backend-process restart retains Chromium but not in-memory PDF/results/jobs; upload again and explicitly start a new inspection.
 
-The React browser panel polls the existing FastAPI server for a JPEG approximately every 1.5 seconds. `page.screenshot()` reads the exact Playwright page, with no unrelated iframe, separate LCW login, VNC, remote worker or browser infrastructure. Frames are sent with `Cache-Control: no-store`; sign-in/unrecognized pages suppress the preview; frames are not written to disk. This is a view-only, low-frame-rate local preview, not a full desktop video stream. Page data can still appear on screen as intended for the operator.
+The job performs the following allowlisted actions from observed LCW navigation:
 
-Current **Take control locally** pauses sign-in dispatch under the same server lock and brings Chromium forward. It does not relay mouse/keyboard input from the React image. Direct use of the native browser remains possible, so the application cannot prevent an operator manually editing LCW there. The read-only constraint applies to implemented agent actions.
+1. Verify the configured LCW origin plus the observed profile/menu markers, with no login attempt.
+2. Open the search-icon link, then the alphabetical family group derived from the PDF family name.
+3. Read actual search-result links and select a unique numeric child-ID target, confirming the name. Duplicate names with a different ID do not qualify; duplicate matching targets stop inspection.
+4. Open only the observed child-detail link. Independently compare visible Child/Student ID, Family ID, Family Center, first name and last name with the source.
+5. Open Program/Room Assignment; recheck family and child context, then parse existing classroom, center, dates and the displayed rate description. A rate description is not treated as a verified program, tuition, reimbursement unit price or copay.
+6. Open Third Party, then the actual child-specific `viewContracts` control. Verify its exact child-specific list heading and family context. Read contract IDs from existing edit-link targets without clicking them, plus the agency and date columns.
+7. Compare all relevant source fields with observed values. Display **Matching**, **Different**, **Missing** or **Not verified**, preserving source text/page and portal evidence. Future approved changes remain null. PRA coverage compares the observed assignment period with the source contract dates; it does not establish complete rate/schedule compatibility.
 
-For future in-panel control, use the existing Chromium CDP session for `Page.startScreencast` and frame acknowledgments, with narrowly validated mouse/key input on the same page. Require a server-held human-control lease, coordinate scaling, session identity and expiry, and re-observation on return. Do not expose the debugging port or arbitrary CDP commands. That upgrade is investigated only; it is not implemented or tested.
+No hardcoded child, family, contract or PRA IDs are used by the agent. `backend/app/inspection.py` separates pure parsing/comparison from lifecycle and browser dispatch. The existing extraction parser and React review remain in use.
 
-References: [Playwright persistent contexts](https://playwright.dev/python/docs/api/class-browsertype#browser-type-launch-persistent-context), [page screenshots](https://playwright.dev/python/docs/api/class-page#page-screenshot), [CDP sessions](https://playwright.dev/python/docs/api/class-cdpsession), [CDP Page](https://chromedevtools.github.io/devtools-protocol/tot/Page/), [Microsoft session lifetime](https://learn.microsoft.com/en-us/entra/identity/conditional-access/concept-session-lifetime).
+Multiple contracts/assignments are all reported. A unique exact source date match (plus agency for contracts) may identify the relevant record; otherwise no first-row selection is assumed. An unreadable/empty table is **not verified**, because the portal's empty-state selectors have not been observed. The comparison supports Missing for confirmed absence, but it does not infer absence from an unrelated global “0 records” label.
 
-## Verification boundary and local use
+### Scope of observed fields
 
-Verified against real LCW: headed launch, Microsoft credential flow, manual MFA handoff, authenticated home, alphabetical family search, child/family/center identity, existing PRA row, and existing contract list. The integrated FastAPI launch/login routes also reached MFA; post-MFA live preview and takeover verification were deliberately left pending at the operator's request. No additional MFA will be initiated for testing in this iteration.
+The verified screens expose identity, contract ID/agency/dates and assignment classroom/dates/displayed rate description. The agent does not open edit, copy, add or save controls. Contract reimbursement settings, unit prices, copays, program and detailed attendance times remain **Not verified** unless a later authorized read-only discovery establishes their actual controls. No fabricated values or results are substituted.
 
-Offline checks cover extraction, health, local API restrictions, rejection of record writes, reuse of the active page, stable persistent-profile path, manual-control lock, no password retries, redaction and timeout handling. These tests use synthetic data/mocks, not an LCW mock application; they do not prove real portal behavior or session persistence.
+### Progress, takeover and recovery
 
-Validation on 2026-10-22: all **33 backend tests passed**; frontend production build and lint passed. PyMuPDF emitted existing SWIG deprecation warnings. The API was restarted with profile reuse enabled without opening a browser or initiating another sign-in.
+The backend owns a single background inspection task; duplicate Inspect requests for its source reuse that job. An idempotency key prevents repeating a completed request after a lost response. Progress events are emitted at actual operation boundaries; no timed/fabricated steps are displayed.
 
-Start the existing API from the repository root with `.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log` (one worker, no reload). Run the existing frontend with its normal `npm run dev` command. Use **Open LCW** only when ready for the first sign-in in the dedicated profile; later starts reuse it. Do not start a second backend/browser for validation. The sample PDF and reference video were not present in this workspace during this iteration; their business facts above come from the supplied PRD/BRD/TRD, not a newly processed original attachment.
+Take Control immediately changes ownership and the cancellation epoch without waiting for the entire task. The current bounded read/navigation may finish (12-second operation limit); the next action cannot start. Return Control independently checks authentication and restarts the inspection from search/identity verification, so native user navigation cannot silently resume against old observations. Stop Inspection cancels the task while retaining the browser and PDF. Network timeouts, missing controls, mismatched identifiers, lost tabs, unknown pages and session expiration either pause or fail with fixed, actionable messages. There are no automatic navigation or login retries.
+
+States include idle, authenticated, awaiting_authentication, awaiting_mfa, inspecting, paused, failed, cancelled and completed. A completed comparison can contain unverified fields; it does not mean contract/PRA setup or full compatibility is verified.
+
+### API and preview
+
+All browser routes and extraction require the local request guard (loopback host/client, `X-LCG-Local: 1`, allowed frontend Origin when supplied). These are development controls, not a production multi-user authentication system.
+
+- Existing `/api/browser/start`, `/login`, `/status`, `/frame`, `/navigation`, `/take-control`, `/return-control`, `/close` remain.
+- `POST /api/browser/reconnect`: existing owned process only, no launch/navigation/login.
+- `POST /api/browser/inspect`: validated extraction ID and request ID; starts one server-side read-only job only when already authenticated and under agent control.
+- `GET /api/browser/inspection`: current progress, source snapshot, observed records and comparison result.
+- `GET /api/browser/document`: recover the in-memory extraction after UI refresh.
+- `POST /api/browser/cancel-inspection`: stop automation and retain the session.
+
+Screenshots come from the exact controlled page, remain in memory and are returned with no-store and their actual capture timestamp. Capture requests are serialized/deduplicated; frames are discarded if navigation changes authentication or the page during capture. Sign-in and unfamiliar pages suppress preview. The image remains view-only; native-window control is required. The UI polls while visible with bounded requests and slows while hidden. Public arbitrary URL, JavaScript, CDP, input and record-write endpoints do not exist.
+
+## Verification status — 2026-10-23
+
+- Offline: **70 backend tests passed** at the final implementation check; TypeScript, production build and lint passed. Existing PyMuPDF SWIG deprecation warnings remain. Tests cover synthetic PDF → real inspection orchestration with a mocked DOM → identity verification → contract/PRA parsing → comparison, wrong identifiers, duplicate/multiple records, immutable source snapshots, cold/concurrent starts, fixed profile and ownership, exact-tab CDP reconnection, preserved browser on API shutdown, MFA/expiry pauses, takeover/resume/cancel, refresh during a running job, sanitized failures, stale-header session-expiry detection, lost-transport ownership cleanup and same-page frame handling.
+- Local API smoke: health returned 200; the local-request guard returned 403 without its header; Inspect without an extraction returned 409. Status remained idle with no browser/job before and after these checks.
+- Live today: status-only check found no active managed browser. No portal navigation, fresh contract/PRA verification, screenshot capture or login/MFA was performed.
+- Still unverified: launch/reattachment and persistent authentication with actual Chromium under the new lifecycle; actual selector timing/table parsing for the autonomous run; authenticated preview and takeover; the original Camila upload-to-result acceptance flow.
+- The milestone is **implemented and offline-tested, not fully verified against LCW**. No LCW data was changed.
+
+Use one existing backend worker without reload: `.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log`. Start the existing frontend normally. Reconnect an existing owned browser when available; do not initiate login/MFA merely to complete a test.
+
+References: [Playwright CDP attachment](https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp), [authentication state sensitivity](https://playwright.dev/python/docs/auth), [Microsoft session lifetime](https://learn.microsoft.com/en-us/entra/identity/conditional-access/concept-session-lifetime).

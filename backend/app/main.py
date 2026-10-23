@@ -1,6 +1,10 @@
 
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
+from pathlib import Path
+
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -45,6 +49,8 @@ app.include_router(database.persistence_router(local_request))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
@@ -101,3 +107,20 @@ async def select_saved_contract(identifier: UUID, response: Response):
     if session.task and not session.task.done() and session.document_id != str(identifier):
         raise HTTPException(409, 'Stop the current inspection before selecting another document.')
     return session.set_document(ContractExtraction.model_validate(saved['extraction']))
+
+
+class SPAFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        if path == 'api' or path.startswith('api/'):
+            raise StarletteHTTPException(404)
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as error:
+            if error.status_code != 404 or Path(path).suffix:
+                raise
+            return await super().get_response('index.html', scope)
+
+
+frontend_dist = Path(__file__).resolve().parents[2] / 'frontend' / 'dist'
+if frontend_dist.is_dir():
+    app.mount('/', SPAFiles(directory=frontend_dist, html=True), name='frontend')

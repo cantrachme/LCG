@@ -1,0 +1,42 @@
+services:
+  app:
+    build: .
+    init: true
+    hostname: lcg-app
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - path: backend/.env
+        format: raw
+    environment:
+      DATABASE_URL: "postgresql+psycopg://lcg:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the root .env file}@db:5432/lcg"
+      LCG_CONTAINER: "1"
+      LCG_BROWSER_PROFILE: /data/browser
+    volumes:
+      - browser_profile:/data/browser
+    shm_size: 1gb
+    stop_grace_period: 30s
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  db:
+    image: postgres:16-bookworm
+    environment:
+      POSTGRES_DB: lcg
+      POSTGRES_USER: lcg
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the root .env file}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lcg -d lcg"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  postgres_data:
+  browser_profile:

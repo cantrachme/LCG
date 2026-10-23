@@ -1,5 +1,6 @@
 """Single local Chromium owner, interruptible read-only LCW inspection."""
 import asyncio
+import ipaddress
 import secrets
 from contextlib import suppress
 from typing import Literal
@@ -25,11 +26,27 @@ from .inspection import (InspectionError, build_result, child_links, expected_id
                          parse_contract_rows, parse_pra_rows, search_group, verify_family_header, verify_identity)
 
 ENV_PATH = Path(__file__).resolve().parents[1] / '.env'
-PROFILE_PATH = ENV_PATH.parent / '.lcw-browser-profile'
+PROFILE_PATH = Path(os.environ.get('LCG_BROWSER_PROFILE', ENV_PATH.parent / '.lcw-browser-profile'))
 AUTH_ORIGIN = 'https://login.microsoftonline.com'
 AUTH_ORIGINS = {AUTH_ORIGIN, 'https://login.microsoft.com', 'https://device.login.microsoftonline.com'}
 VIEW_WIDTH, VIEW_HEIGHT = 1280, 800
-LOCAL_ORIGINS = {'http://localhost:5173', 'http://127.0.0.1:5173'}
+LOCAL_ORIGINS = {'http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:8000', 'http://127.0.0.1:8000'}
+
+def local_peer(request):
+    if request.client is None:
+        return False
+    if request.client.host in {'127.0.0.1', '::1', 'testclient'}:
+        return True
+    # Docker NAT changes the peer address. Browser Origin / same-origin Fetch Metadata plus the
+    # existing exact Host and HTTP header / single-use WS ticket remain enforced.
+    try:
+        return (os.environ.get('LCG_CONTAINER') == '1'
+                and (request.headers.get('origin') in LOCAL_ORIGINS
+                     or (request.headers.get('origin') is None
+                         and request.headers.get('sec-fetch-site') == 'same-origin'))
+                and ipaddress.ip_address(request.client.host).is_private)
+    except ValueError:
+        return False
 
 
 def origin(url):
@@ -38,7 +55,7 @@ def origin(url):
 
 
 def local_request(request: Request):
-    if (request.client is None or request.client.host not in {'127.0.0.1', '::1', 'testclient'}
+    if (not local_peer(request)
             or request.url.hostname not in {'localhost', '127.0.0.1', '::1', 'testserver'}
             or request.headers.get('x-lcg-local') != '1'
             or (request.headers.get('origin') is not None and request.headers['origin'] not in LOCAL_ORIGINS)):
@@ -153,6 +170,27 @@ class LCWSession:
             self.owner_file.close()
             self.owner_file = None
 
+    def clear_stale_container_locks(self):
+        # Only the dedicated Linux volume, after taking its exclusive owner lock.
+        # Never touch the macOS profile or remove locks while Chromium is alive.
+        if os.environ.get('LCG_CONTAINER') != '1' or PROFILE_PATH != Path('/data/browser'):
+            return
+        try:
+            for entry in Path('/proc').iterdir():
+                if entry.name.isdigit():
+                    try:
+                        args = (entry / 'cmdline').read_bytes().split(b'\0')
+                    except FileNotFoundError:
+                        continue
+                    if f'--user-data-dir={PROFILE_PATH}'.encode() in args:
+                        return
+        except OSError:
+            raise HTTPException(409, 'Cannot verify container browser ownership; profile retained.') from None
+        for name in ('SingletonLock', 'SingletonSocket', 'SingletonCookie', 'DevToolsActivePort', '.lcg-browser.json'):
+            path = PROFILE_PATH / name
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+
     def metadata(self):
         try:
             return json.loads((PROFILE_PATH / '.lcg-browser.json').read_text())
@@ -226,12 +264,13 @@ class LCWSession:
                 return await self.observe()
             if self.playwright:
                 await self.disconnect()
-            self.config = dotenv_values(ENV_PATH, interpolate=False)
+            self.config = {**dotenv_values(ENV_PATH, interpolate=False), **os.environ}
             target = self.config.get('LCW_URL', '')
             p = urlsplit(target)
             if p.scheme != 'https' or not p.hostname or p.username or p.password or p.query or p.fragment:
                 raise HTTPException(503, 'Configure an HTTPS LCW_URL without embedded credentials, query or fragment in backend/.env.')
             self.claim_profile()
+            self.clear_stale_container_locks()
             metadata = self.metadata()
             alive = self.owned_process_alive(metadata)
             if not alive and isinstance(metadata.get('pid'), int):
@@ -263,6 +302,7 @@ class LCWSession:
                         self.playwright.chromium.executable_path, f'--user-data-dir={PROFILE_PATH}',
                         '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0',
                         '--headless=new', '--window-size=1280,800',
+                        *(['--no-sandbox'] if os.environ.get('LCG_CONTAINER') == '1' else []),
                         '--no-first-run', '--no-default-browser-check', 'about:blank',
                     ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
                     self.process = process
@@ -781,6 +821,14 @@ class LCWSession:
         if self.task and not self.task.done():
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
+        if os.environ.get('LCG_CONTAINER') == '1' and self.browser:
+            # Container termination cannot retain a process; flush its persistent profile.
+            with suppress(PlaywrightError):
+                cdp = await self.browser.new_browser_cdp_session()
+                await cdp.send('Browser.close')
+            if self.process:
+                with suppress(subprocess.TimeoutExpired):
+                    await asyncio.to_thread(self.process.wait, timeout=10)
         await self.disconnect()
 
     async def close(self):
@@ -831,7 +879,7 @@ viewer_router = APIRouter()
 
 @viewer_router.websocket('/api/browser/stream')
 async def browser_stream(websocket: WebSocket):
-    if (websocket.client is None or websocket.client.host not in {'127.0.0.1', '::1', 'testclient'}
+    if (not local_peer(websocket)
             or websocket.url.hostname not in {'localhost', '127.0.0.1', '::1', 'testserver'}
             or websocket.headers.get('origin') not in LOCAL_ORIGINS):
         await websocket.close(code=4403)

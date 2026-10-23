@@ -55,7 +55,7 @@ function mergeMessages(previous: Message[], incoming: Message[]) {
 }
 type Message = { id: string; role: string; content: string; created_at: string }
 type DocumentRecord = { id: string; conversation_id: string; extraction: ContractExtraction; metadata: { filename: string }; created_at: string }
-const api = 'http://127.0.0.1:8000/api'
+const api = '/api'
 const ignoreBrowserRestore = () => {} // Chat selection owns its document, not the last global browser job.
 const timestamp = (value: string) => new Date(value).toLocaleString()
 

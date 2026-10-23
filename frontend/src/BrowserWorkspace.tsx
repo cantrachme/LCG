@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ContractExtraction } from './App'
 
-const api = 'http://127.0.0.1:8000/api/browser'
+const api = '/api/browser'
 type Event = { stage: string; state: string; at: string }
 type Job = { id: string; extraction_id: string; state: string; stage: string; version: number; events: Event[] }
 type Session = {
@@ -211,7 +211,9 @@ function EmbeddedBrowser({ session, onStatus }: { session: Session | null; onSta
       try {
         const { ticket } = await (await request('viewer-ticket', 'POST', controller.signal)).json()
         if (stopped) return
-        connection = new WebSocket(`${api.replace('http:', 'ws:')}/stream`)
+        const streamUrl = new URL(`${api}/stream`, window.location.href)
+        streamUrl.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+        connection = new WebSocket(streamUrl)
         socket.current = connection
         connection.onopen = () => connection?.send(ticket)
         connection.onmessage = (event) => {

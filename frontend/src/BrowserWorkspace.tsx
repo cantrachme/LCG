@@ -6,6 +6,7 @@ type Event = { stage: string; state: string; at: string }
 type Job = { id: string; extraction_id: string; state: string; stage: string; version: number; events: Event[] }
 type Session = {
   state: string; message: string; owner: string; active: boolean; busy: boolean
+  epoch: number; loading: boolean; launch_mode: string; control_pending: boolean
   location: string | null; preview_available: boolean; authenticated: boolean; inspection: Job | null
 }
 type Comparison = {
@@ -46,23 +47,13 @@ export default function BrowserWorkspace({ extraction, onRestore }: {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [connectionError, setConnectionError] = useState<string | null>(null)
-  const [frame, setFrame] = useState<string | null>(null)
-  const [captured, setCaptured] = useState<string | null>(null)
   const [inspection, setInspection] = useState<Inspection | null>(null)
-  const frameUrl = useRef<string | null>(null)
   const version = useRef('')
   const actionController = useRef<AbortController | null>(null)
   const actionPending = useRef(false)
   const actionVersion = useRef(0)
   const restore = useRef(onRestore)
   useEffect(() => { restore.current = onRestore }, [onRestore])
-
-  function clearFrame() {
-    if (frameUrl.current) URL.revokeObjectURL(frameUrl.current)
-    frameUrl.current = null
-    setFrame(null)
-    setCaptured(null)
-  }
 
   useEffect(() => {
     let active = true
@@ -84,41 +75,25 @@ export default function BrowserWorkspace({ extraction, onRestore }: {
             setInspection(detail)
             version.current = key
           }
-          if (current.preview_available) {
-            const response = await fetch(`${api}/frame`, { headers: { 'X-LCG-Local': '1' }, cache: 'no-store', signal })
-            if (response.ok) {
-              const blob = await response.blob()
-              if (!active) return
-              const next = URL.createObjectURL(blob)
-              if (frameUrl.current) URL.revokeObjectURL(frameUrl.current)
-              frameUrl.current = next
-              setFrame(next)
-              const capturedAt = response.headers.get('X-LCG-Captured-At')
-              setCaptured(capturedAt ? new Date(capturedAt).toLocaleTimeString() : 'time unavailable')
-            } else if (response.status !== 409) {
-              clearFrame()
-            }
-          } else if (!current.preview_available) clearFrame()
+
         }
       } catch {
         if (active) {
-          clearFrame()
           setConnectionError('Browser connection unavailable. Reconnecting does not restart Chromium or sign in.')
         }
       } finally {
-        if (active) timer = window.setTimeout(refresh, document.hidden ? 5000 : 1500)
+        if (active) timer = window.setTimeout(refresh, document.hidden ? 5000 : 2000)
       }
     }
     void request('document', 'GET', controller.signal).then(response => response.json()).then((source: ContractExtraction | null) => {
       if (active && source) restore.current(source)
     }).catch(() => { /* Status polling reports the connection error. */ })
-    void refresh()
+    void request('reconnect', 'POST', controller.signal).catch(() => { /* Never launches a new session. */ }).finally(() => { if (active) void refresh() })
     return () => {
       active = false
       controller.abort()
       actionController.current?.abort()
       window.clearTimeout(timer)
-      if (frameUrl.current) URL.revokeObjectURL(frameUrl.current)
     }
   }, [])
 
@@ -137,7 +112,6 @@ export default function BrowserWorkspace({ extraction, onRestore }: {
       if (currentAction !== actionVersion.current) return
       setSession(current)
       if (action === 'inspect' && current.inspection?.id !== inspection?.id) setInspection(null)
-      if (!current.preview_available) clearFrame()
     } catch (failure) {
       if (currentAction === actionVersion.current) setError(failure instanceof Error ? failure.message : 'Browser action failed. Check the existing window.')
     } finally {
@@ -161,10 +135,10 @@ export default function BrowserWorkspace({ extraction, onRestore }: {
     <div className="browser-content live-browser">
       <div className="browser-actions">
         <button className="connection-button" disabled={busy || session?.active} onClick={() => void act('reconnect')}>Reconnect existing browser</button>
-        <button className="connection-button" disabled={busy || session?.active} onClick={() => void act('start')}>Open dedicated browser</button>
-        <button className="connection-button" disabled={busy || session?.state !== 'awaiting_authentication'} onClick={() => void act('login')}>Sign in explicitly</button>
+        <button className="connection-button" disabled={busy || session?.active} onClick={() => void act('start')}>Open embedded browser</button>
+
         <button className="connection-button" disabled={!session?.active} onClick={() => void act(session?.owner === 'human' ? 'return-control' : 'take-control')}>
-          {session?.owner === 'human' ? 'Return control' : 'Take control locally'}
+          {session?.owner === 'human' ? 'Return Control' : 'Take Control'}
         </button>
         <button className="connection-button" disabled={busy || !running(job)} onClick={() => void act('cancel-inspection')}>Stop inspection</button>
         <button className="connection-button" disabled={busy || !session?.active || running(job)} onClick={() => void act('close')}>Close browser explicitly</button>
@@ -176,13 +150,8 @@ export default function BrowserWorkspace({ extraction, onRestore }: {
       {connectionError && <p className="upload-error" role="alert">{connectionError}</p>}
       {error && <p className="upload-error" role="alert">{error}</p>}
       <div className="browser-location">{session?.location ?? 'No controlled page open'}</div>
-      {frame ? <figure className="live-frame">
-        <img src={frame} alt="View of the exact LCW Chromium page controlled by Playwright" />
-        <figcaption>Same controlled page · Captured {captured} · View only{session?.busy ? ' · Navigation in progress' : ''}</figcaption>
-      </figure> : <div className="browser-empty-state">
-        <h3>{session?.active ? 'Use the existing Chromium window' : 'Your dedicated LCW session'}</h3>
-        <p>The preview appears after portal authentication is verified. Manual input takes place in the same local window; the image does not accept clicks or typing.</p>
-      </div>}
+      <EmbeddedBrowser session={session} onStatus={setSession} />
+      {session?.active && session.launch_mode !== 'headless' && <p className="review-description">Reconnected to the existing browser without closing it. To switch to headless mode when ready, stop inspection, explicitly close the browser, then open it again. The profile is retained.</p>}
       {job && <section className="inspection-progress" aria-label="Inspection progress">
         <h3>{label(job.state)}</h3><p>{job.stage}</p>
         <ol>{job.events.map((event, index) => <li key={`${index}-${event.at}`}><time>{new Date(event.at).toLocaleTimeString()}</time> {event.stage}</li>)}</ol>
@@ -212,4 +181,178 @@ export default function BrowserWorkspace({ extraction, onRestore }: {
       <div className="browser-note"><p>One profile is retained across application restarts. Microsoft/LCW controls authentication expiry. Take Control pauses at the next bounded operation; Return Control re-verifies identity before restarting inspection. No agent editing, add, copy or save actions are implemented.</p></div>
     </div>
   </section>
+}
+
+
+function EmbeddedBrowser({ session, onStatus }: { session: Session | null; onStatus: (value: Session) => void }) {
+  const [frame, setFrame] = useState<string | null>(null)
+  const [state, setState] = useState('disconnected')
+  const [message, setMessage] = useState('Open or reconnect to the dedicated browser.')
+  const [expanded, setExpanded] = useState(false)
+  const socket = useRef<WebSocket | null>(null)
+  const current = useRef(session)
+  const surface = useRef<HTMLDivElement | null>(null)
+  const image = useRef<HTMLImageElement | null>(null)
+  const inputQueue = useRef<Record<string, unknown>[]>([])
+  const awaitingInput = useRef(false)
+  useEffect(() => { current.current = session }, [session])
+  const active = !!session?.active
+
+  useEffect(() => {
+    if (!active) return
+    let stopped = false
+    let retry: number
+    let heartbeat: number
+    let connection: WebSocket | null = null
+    const controller = new AbortController()
+    async function connect() {
+      setState('loading')
+      setMessage('Connecting to the controlled page…')
+      try {
+        const { ticket } = await (await request('viewer-ticket', 'POST', controller.signal)).json()
+        if (stopped) return
+        connection = new WebSocket(`${api.replace('http:', 'ws:')}/stream`)
+        socket.current = connection
+        connection.onopen = () => connection?.send(ticket)
+        connection.onmessage = (event) => {
+          if (stopped) return
+          const data = JSON.parse(event.data)
+          if (data.type === 'frame') {
+            const next = new Image()
+            next.onload = () => {
+              if (stopped || connection?.readyState !== WebSocket.OPEN) return
+              setFrame(next.src)
+              setMessage('')
+              setState('live')
+              connection.send(JSON.stringify({ type: 'ack' }))
+            }
+            next.onerror = () => connection?.close()
+            next.src = `data:image/jpeg;base64,${data.data}`
+          } else if (data.type === 'status') {
+            current.current = data.session
+            onStatus(data.session)
+            if (data.session.owner !== 'human') inputQueue.current = []
+            if (!data.session.preview_available) {
+              setFrame(null)
+              setState('paused')
+              setMessage('Page unavailable. Use LCW home to return to the configured portal.')
+            }
+          } else if (data.type === 'input_ack' || data.type === 'input_error') {
+            awaitingInput.current = false
+            if (data.type === 'input_error') {
+              inputQueue.current = []
+              setMessage(data.message)
+            } else {
+              setMessage('')
+              const next = inputQueue.current.shift()
+              if (next && connection?.readyState === WebSocket.OPEN) {
+                awaitingInput.current = true
+                connection.send(JSON.stringify(next))
+              }
+            }
+          }
+        }
+        connection.onclose = (event) => {
+          socket.current = null
+          setFrame(null)
+          setState('disconnected')
+          inputQueue.current = []
+          awaitingInput.current = false
+          setMessage(event.code === 4409 ? 'Another Command Center tab has the viewer. Close that tab to connect here.' : 'Viewer disconnected. Reconnecting to the same session…')
+          if (!stopped) retry = window.setTimeout(connect, 2000)
+        }
+        connection.onerror = () => { setState('error'); setMessage('Browser connection interrupted.') }
+        window.clearInterval(heartbeat)
+        heartbeat = window.setInterval(() => {
+          if (connection?.readyState === WebSocket.OPEN) connection.send(JSON.stringify({ type: 'ping' }))
+        }, 5000)
+      } catch {
+        if (!stopped) {
+          setState('error')
+          setMessage('Viewer unavailable. Retrying without launching or signing in.')
+          retry = window.setTimeout(connect, 3000)
+        }
+      }
+    }
+    void connect()
+    return () => {
+      stopped = true
+      controller.abort()
+      window.clearTimeout(retry)
+      window.clearInterval(heartbeat)
+      if (connection) { connection.onclose = null; connection.close() }
+      socket.current = null
+      inputQueue.current = []
+      awaitingInput.current = false
+    }
+  }, [active, onStatus])
+
+  const enabled = active && state === 'live' && session?.owner === 'human' && !session.control_pending && session.preview_available
+  const canNavigate = active && session?.owner === 'human' && !session.control_pending && !['disconnected', 'error', 'loading'].includes(state)
+  function send(data: Record<string, unknown>) {
+    const owner = current.current
+    if (!(enabled || (canNavigate && ['home', 'back', 'forward'].includes(String(data.type)))) || !owner || owner.owner !== 'human' || owner.control_pending || socket.current?.readyState !== WebSocket.OPEN) return
+    const event = { ...data, epoch: owner.epoch }
+    if (awaitingInput.current) {
+      if (inputQueue.current.length < 64) inputQueue.current.push(event)
+      else { inputQueue.current = []; setMessage('Input paused: connection is slow. Retry after it catches up.') }
+    } else {
+      awaitingInput.current = true
+      socket.current.send(JSON.stringify(event))
+    }
+  }
+  function point(clientX: number, clientY: number) {
+    const rect = image.current!.getBoundingClientRect()
+    return { x: Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)), y: Math.max(0, Math.min(1, (clientY - rect.top) / rect.height)) }
+  }
+  // Native non-passive listener keeps scrolling inside the remote page.
+  const wheelSend = useRef(send)
+  useEffect(() => { wheelSend.current = send })
+  useEffect(() => {
+    const element = surface.current
+    if (!element) return
+    const wheel = (event: WheelEvent) => {
+      event.preventDefault()
+      if (!image.current) return
+      const factor = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 800 : 1
+      wheelSend.current({ type: 'wheel', ...point(event.clientX, event.clientY), delta_x: Math.max(-1600, Math.min(1600, event.deltaX * factor)), delta_y: Math.max(-1600, Math.min(1600, event.deltaY * factor)) })
+    }
+    element.addEventListener('wheel', wheel, { passive: false })
+    return () => element.removeEventListener('wheel', wheel)
+  }, [])
+
+  return <div className={`embedded-browser${expanded ? ' browser-expanded' : ''}`}>
+    <div className="browser-actions viewer-toolbar">
+      <button className="connection-button" disabled={!canNavigate} onClick={() => send({ type: 'back' })}>Back</button>
+      <button className="connection-button" disabled={!canNavigate} onClick={() => send({ type: 'forward' })}>Forward</button>
+      <button className="connection-button" disabled={!canNavigate} onClick={() => send({ type: 'home' })}>LCW home</button>
+      <button className="connection-button" disabled={!enabled} onClick={() => send({ type: 'reload' })}>Reload page</button>
+      <button className="connection-button" onClick={() => setExpanded(!expanded)}>{expanded ? 'Exit expanded view' : 'Expand browser'}</button>
+      <span role="status">{!active ? 'Disconnected' : session.loading ? 'Loading page…' : enabled ? 'Human control' : session.owner === 'human' ? 'Paused · waiting for current operation' : 'Agent control · input disabled'}</span>
+    </div>
+    <div ref={surface} className={`browser-surface ${enabled ? 'human-control' : ''}`} tabIndex={enabled ? 0 : -1}
+      role="application" aria-label="Interactive LCW browser" aria-disabled={!enabled}
+      onClick={event => {
+        if (event.target !== image.current) return
+        surface.current?.focus({ preventScroll: true })
+        send({ type: 'click', ...point(event.clientX, event.clientY) })
+      }}
+      onKeyDown={event => {
+        if (!enabled) return
+        // Allow an explicit keyboard exit from the remote surface.
+        if (event.key === 'Escape' && event.shiftKey) { surface.current?.blur(); return }
+        if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'v') return
+        event.preventDefault()
+        if (event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey) send({ type: 'text', text: event.key })
+        else if (['Tab', 'Enter', 'Backspace', 'Delete', 'Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown', 'a'].includes(event.key)) {
+          send({ type: 'key', key: event.key, shift: event.shiftKey, control: event.ctrlKey, meta: event.metaKey })
+        }
+      }}
+      onPaste={event => { event.preventDefault(); send({ type: 'text', text: event.clipboardData.getData('text/plain').slice(0, 2000) }) }}>
+      {active && frame ? <img ref={image} src={frame} draggable={false} alt="Live controlled LCW page" />
+        : <div className="browser-empty-state"><h3>{active ? (state === 'paused' ? 'Browser paused' : 'Connecting browser') : 'Your dedicated LCW session'}</h3><p>{message}</p></div>}
+    </div>
+    <p className="viewer-caption">{active ? `Live browser · ${state} · ${enabled ? 'Click to type; Shift+Escape exits keyboard control.' : 'Select Take Control to interact.'}` : 'Open or reconnect to view the browser.'}</p>
+    {message && active && <p className="viewer-caption" role="status">{message}</p>}
+  </div>
 }

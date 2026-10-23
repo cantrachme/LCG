@@ -6,7 +6,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
 from .contracts import MAX_FILE_BYTES, ContractExtraction, ExtractionError, extract_contract
-from .browser import local_request, router as browser_router, session
+from .browser import local_request, router as browser_router, viewer_router, session
 
 
 @asynccontextmanager
@@ -22,6 +22,7 @@ app = FastAPI(
 )
 
 app.include_router(browser_router)
+app.include_router(viewer_router)
 
 app.add_middleware(
     CORSMiddleware,

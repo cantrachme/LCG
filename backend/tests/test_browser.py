@@ -51,7 +51,7 @@ def row(cells, href=None):
 
 def test_browser_api_rejects_untrusted_requests_and_record_writes():
     client = TestClient(app)
-    for route in ('status', 'inspection', 'document', 'frame'):
+    for route in ('status', 'inspection', 'document'):
         assert client.get('/api/browser/' + route).status_code == 403
     assert client.post('/api/browser/start', headers={**HEADERS, 'Origin': 'https://untrusted.example'}).status_code == 403
     assert client.get('/api/browser/status', headers={**HEADERS, 'Host': 'untrusted.example'}).status_code == 403
@@ -186,22 +186,21 @@ def test_auth_is_false_after_navigation_or_browser_closure():
     assert s.result()['authenticated']
     s.page.url = 'https://login.microsoftonline.com/challenge'
     assert not s.result()['authenticated']
-    assert not s.result()['preview_available']
+    assert s.result()['preview_available']  # Manual sign-in is visible in the embedded viewer.
     assert s.result()['state'] != 'authenticated'
     s.page.is_closed.return_value = True
     assert not s.result()['active']
 
 
-def test_mfa_blocks_preview_and_repeated_login():
+def test_mfa_visible_but_login_action_never_submits_credentials():
     s = attached()
     s.state, s.owner, s.portal_authenticated = 'awaiting_mfa', 'human', False
     s.page.url = module.AUTH_ORIGIN + '/challenge'
-    s.page.screenshot = AsyncMock()
-    with pytest.raises(HTTPException):
-        asyncio.run(s.login())
-    with pytest.raises(HTTPException):
-        asyncio.run(s.frame())
-    s.page.screenshot.assert_not_awaited()
+    for _ in range(3):
+        result = asyncio.run(s.login())
+        assert result['preview_available']
+        assert result['owner'] == 'human'
+        assert not result['authenticated']
     s.page.locator.assert_not_called()
 
 
@@ -210,8 +209,7 @@ def test_password_not_automatically_retried_after_prior_attempt():
     s.state, s.portal_authenticated = 'awaiting_authentication', False
     s.page.url = module.AUTH_ORIGIN + '/login'
     s.login_attempted = True
-    with pytest.raises(HTTPException):
-        asyncio.run(s.login())
+    asyncio.run(s.login())
     s.page.locator.assert_not_called()
 
 
@@ -611,25 +609,6 @@ def test_mfa_detection_does_not_report_authentication_or_call_login():
     s.login.assert_not_awaited()
 
 
-def test_preview_uses_same_page_deduplicates_and_discards_navigation_frames():
-    s = attached()
-    s.page.screenshot = AsyncMock(return_value=b'synthetic jpeg')
-    async def run():
-        first = await s.frame()
-        second = await s.frame()
-        assert first == second
-        s.last_frame_at = 0
-        async def capture(**kwargs):
-            s.page.url = module.AUTH_ORIGIN + '/challenge'
-            return b'frame to discard'
-        s.page.screenshot.side_effect = capture
-        with pytest.raises(HTTPException):
-            await s.frame()
-    asyncio.run(run())
-    assert s.page.screenshot.await_count == 2
-    assert s.last_frame is None
-
-
 def test_concurrent_cold_starts_launch_one_owned_process_with_fixed_profile(monkeypatch, tmp_path):
     path = tmp_path / 'profile'
     monkeypatch.setattr(module, 'PROFILE_PATH', path)
@@ -663,6 +642,7 @@ def test_concurrent_cold_starts_launch_one_owned_process_with_fixed_profile(monk
     assert f'--user-data-dir={path}' in args[0]
     assert '--remote-debugging-address=127.0.0.1' in args[0]
     assert '--remote-debugging-port=0' in args[0]
+    assert '--headless=new' in args[0]
     assert kwargs['start_new_session'] is True
     assert path.is_dir()
 
@@ -681,7 +661,9 @@ def test_cdp_reconnect_keeps_exact_target_among_multiple_tabs(monkeypatch, tmp_p
     s = module.LCWSession()
     s.playwright = MagicMock()
     s.playwright.chromium.connect_over_cdp = AsyncMock(return_value=browser)
+    s.secure_page = AsyncMock()
     asyncio.run(s.attach({'pid':123, 'target':'controlled-tab'}))
+    s.secure_page.assert_awaited_once()
     assert s.page is pages[1]
     context.new_page.assert_not_called()
     for page in pages:
@@ -816,3 +798,171 @@ def test_lost_transport_cannot_retain_profile_ownership(monkeypatch, tmp_path):
     another = module.LCWSession()
     another.claim_profile()
     another.release_profile()
+
+
+def test_input_vocabulary_coordinates_and_secrets_are_rejected_without_dispatch():
+    from pydantic import ValidationError
+    for payload in ({'type': 'evaluate', 'epoch': 0}, {'type': 'text', 'epoch': 0, 'script': 'secret'},
+                    {'type': 'click', 'epoch': 0, 'x': 1.01}, {'type': 'click', 'epoch': 0, 'y': float('nan')},
+                    {'type': 'key', 'epoch': 0, 'key': 'F12'}, {'type': 'text', 'epoch': 0, 'text': 'x' * 2001}):
+        with pytest.raises(ValidationError):
+            module.BrowserInput.model_validate(payload)
+
+
+def test_human_input_uses_same_page_scales_and_enforces_lease_epoch_and_owner():
+    s = attached()
+    s.owner = 'human'
+    lease = s.viewer = object()
+    s.page.mouse.click = AsyncMock()
+    s.page.mouse.move = AsyncMock()
+    s.page.mouse.wheel = AsyncMock()
+    s.page.keyboard.insert_text = AsyncMock()
+    s.page.keyboard.press = AsyncMock()
+    def event(**data):
+        return module.BrowserInput(epoch=s.epoch, **data)
+    async def run():
+        await s.human_input(event(type='click', x=0.5, y=0.25), lease)
+        await s.human_input(event(type='wheel', x=0.5, y=0.25, delta_y=120), lease)
+        await s.human_input(event(type='text', text='synthetic'), lease)
+        await s.human_input(event(type='key', key='Tab', shift=True), lease)
+        with pytest.raises(HTTPException):
+            await s.human_input(event(type='click'), object())
+        stale = event(type='click')
+        await s.take_control()
+        with pytest.raises(HTTPException):
+            await s.human_input(stale, lease)
+        s.owner = 'agent'
+        with pytest.raises(HTTPException):
+            await s.human_input(event(type='click'), lease)
+    asyncio.run(run())
+    s.page.mouse.click.assert_awaited_once_with(640, 200)
+    s.page.mouse.wheel.assert_awaited_once_with(0, 120)
+    s.page.keyboard.insert_text.assert_awaited_once_with('synthetic')
+    s.page.keyboard.press.assert_awaited_once_with('Shift+Tab')
+    s.context.new_page.assert_not_called()
+
+
+def test_human_input_waits_for_inflight_inspection_boundary():
+    s = attached()
+    s.job = {'state':'inspecting','stage':'requested','version':0,'events':[]}
+    s.viewer = object()
+    s.page.mouse.click = AsyncMock()
+    entered, release = asyncio.Event(), asyncio.Event()
+    async def operation():
+        entered.set()
+        await release.wait()
+    async def run():
+        step = asyncio.create_task(s.step('Read', operation, s.epoch))
+        await entered.wait()
+        await s.take_control()
+        human = asyncio.create_task(s.human_input(module.BrowserInput(type='click', epoch=s.epoch), s.viewer))
+        await asyncio.sleep(0)
+        s.page.mouse.click.assert_not_awaited()
+        release.set()
+        with pytest.raises(module.Paused):
+            await step
+        await human
+    asyncio.run(run())
+    s.page.mouse.click.assert_awaited_once()
+
+
+def test_viewer_origin_ticket_expiration_replay_and_single_viewer(monkeypatch):
+    from starlette.websockets import WebSocketDisconnect
+    s = attached()
+    monkeypatch.setattr(module, 'session', s)
+    async def ready(ws):
+        await ws.send_json({'ready': True})
+    s.stream = AsyncMock(side_effect=ready)
+    client = TestClient(app)
+    assert client.post('/api/browser/viewer-ticket').status_code == 403
+    for origin in (None, 'https://evil.example'):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect('/api/browser/stream', headers={'Origin': origin} if origin else {}):
+                pass
+    ticket = client.post('/api/browser/viewer-ticket', headers=HEADERS).json()['ticket']
+    with client.websocket_connect('/api/browser/stream', headers={'Origin': 'http://localhost:5173'}) as ws:
+        ws.send_text(ticket)
+        assert ws.receive_json() == {'ready': True}
+    # Use explicit rejection to verify consumed and expired tickets.
+    assert ticket not in s.tickets
+    s.stream.assert_awaited_once()
+    s.tickets['expired'] = 0
+    for invalid in (ticket, 'expired', 'unknown'):
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect('/api/browser/stream', headers={'Origin': 'http://localhost:5173'}) as ws:
+                ws.send_text(invalid)
+                ws.receive_json()
+    s.viewer = object()
+    ws = MagicMock(close=AsyncMock())
+    asyncio.run(module.LCWSession.stream(s, ws))
+    ws.close.assert_awaited_once_with(code=4409, reason='Another Command Center viewer is connected.')
+
+
+def test_navigation_allowlist_is_exact_and_https_only():
+    s = attached()
+    for url in ('https://portal.example/center/record', module.AUTH_ORIGIN + '/challenge'):
+        assert s.allowed_url(url)
+    for url in ('https://portal.example.evil.test/', 'https://login.microsoftonline.com.evil.test/',
+                'http://portal.example/', 'https://user:pass@portal.example/', 'file:///etc/passwd',
+                'javascript:alert(1)', 'data:text/html,hello', 'https://evil.test/'):
+        assert not s.allowed_url(url)
+
+
+def test_navigation_guard_blocks_external_redirects_and_new_tabs():
+    s = attached()
+    cdp = MagicMock(send=AsyncMock(), detach=AsyncMock())
+    s.context.route = AsyncMock()
+    s.context.new_cdp_session = AsyncMock(return_value=cdp)
+    async def run():
+        await s.secure_page()
+        guard = s.context.route.call_args.args[1]
+        route = MagicMock(abort=AsyncMock(), fallback=AsyncMock())
+        route.request.url = 'https://evil.example/'
+        route.request.is_navigation_request.return_value = True
+        await guard(route)
+        route.abort.assert_awaited_once()
+        route.fallback.assert_not_awaited()
+        assert s.owner == 'human'
+        route.request.url = module.AUTH_ORIGIN + '/challenge'
+        await guard(route)
+        route.fallback.assert_awaited_once()
+        popup = s.context.on.call_args.args[1]
+        page = MagicMock(close=AsyncMock())
+        await popup(page)
+        page.close.assert_awaited_once()
+    asyncio.run(run())
+
+
+def test_stream_frames_are_bounded_acknowledged_and_cleanup_preserves_browser():
+    s = attached()
+    cdp = MagicMock(send=AsyncMock(), detach=AsyncMock())
+    s.context.new_cdp_session = AsyncMock(return_value=cdp)
+    s.page.set_viewport_size = AsyncMock()
+    incoming = asyncio.Queue()
+    seen = []
+    async def send(data):
+        seen.append(data)
+        if data['type'] == 'frame':
+            await incoming.put(json.dumps({'type': 'ack'}))
+            await incoming.put(None)
+    async def receive():
+        data = await incoming.get()
+        if data is None:
+            raise module.WebSocketDisconnect()
+        return data
+    ws = MagicMock(send_json=send, receive_text=receive, close=AsyncMock())
+    async def run():
+        task = asyncio.create_task(s.stream(ws))
+        while not cdp.on.called:
+            await asyncio.sleep(0)
+        callback = next(c.args[1] for c in cdp.on.call_args_list if c.args[0] == 'Page.screencastFrame')
+        await callback({'data': 'synthetic-base64', 'sessionId': 42})
+        await asyncio.wait_for(task, 2)
+    asyncio.run(run())
+    assert any(frame == {'type': 'frame', 'data': 'synthetic-base64'} for frame in seen)
+    assert s.viewer is None
+    assert s.page is not None
+    cdp.send.assert_any_await('Page.screencastFrameAck', {'sessionId': 42})
+    cdp.send.assert_any_await('Page.stopScreencast')
+    s.browser.close.assert_not_called()
+    s.context.new_page.assert_not_called()

@@ -1,5 +1,8 @@
 """Single local Chromium owner, interruptible read-only LCW inspection."""
 import asyncio
+import secrets
+from contextlib import suppress
+from typing import Literal
 import fcntl
 import json
 import os
@@ -12,8 +15,8 @@ from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from dotenv import dotenv_values
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeout, async_playwright
 
 from .contracts import ContractExtraction
@@ -23,6 +26,8 @@ from .inspection import (InspectionError, build_result, child_links, expected_id
 ENV_PATH = Path(__file__).resolve().parents[1] / '.env'
 PROFILE_PATH = ENV_PATH.parent / '.lcw-browser-profile'
 AUTH_ORIGIN = 'https://login.microsoftonline.com'
+AUTH_ORIGINS = {AUTH_ORIGIN, 'https://login.microsoft.com', 'https://device.login.microsoftonline.com'}
+VIEW_WIDTH, VIEW_HEIGHT = 1280, 800
 LOCAL_ORIGINS = {'http://localhost:5173', 'http://127.0.0.1:5173'}
 
 
@@ -53,10 +58,32 @@ class InspectRequest(BaseModel):
     request_id: str = Field(min_length=36, max_length=36)
 
 
+class BrowserInput(BaseModel):
+    """Finite input vocabulary; no caller-supplied CDP, scripts or URLs."""
+    model_config = ConfigDict(extra='forbid', strict=True)
+    type: Literal['click', 'wheel', 'key', 'text', 'back', 'forward', 'reload', 'home']
+    epoch: int = Field(ge=0)
+    x: float = Field(default=0, ge=0, le=1, allow_inf_nan=False)
+    y: float = Field(default=0, ge=0, le=1, allow_inf_nan=False)
+    delta_x: float = Field(default=0, ge=-1600, le=1600, allow_inf_nan=False)
+    delta_y: float = Field(default=0, ge=-1600, le=1600, allow_inf_nan=False)
+    text: str = Field(default='', max_length=2000)
+    key: Literal['Tab', 'Enter', 'Backspace', 'Delete', 'Escape', 'ArrowLeft', 'ArrowRight',
+                 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown', 'a'] = 'Tab'
+    shift: bool = False
+    control: bool = False
+    meta: bool = False
+
+
 class LCWSession:
     def __init__(self):
         self.lock = asyncio.Lock()
-        self.frame_lock = asyncio.Lock()
+        self.viewer = None
+        self.tickets = {}
+        self.loading = False
+        self.agent_operation = False
+        self.launch_mode = 'existing'
+        self.process = None
         self.playwright = self.browser = self.context = self.page = None
         self.config = {}
         self.owner_file = None
@@ -73,10 +100,6 @@ class LCWSession:
         self.resume.set()
         self.document = None
         self.document_id = None
-        self.last_frame = None
-        self.last_frame_at = 0.0
-        self.last_frame_url = None
-        self.last_frame_captured = None
 
     def set_document(self, document):
         self.document_id = str(uuid4())
@@ -104,7 +127,9 @@ class LCWSession:
             state = 'inspecting' if workflow == 'inspecting' else 'awaiting_authentication'
         return {'state': state, 'message': self.message, 'owner': self.owner, 'active': self.active(),
                 'read_only': True, 'authenticated': auth, 'location': origin(self.page.url) if self.active() else None,
-                'preview_available': auth, 'busy': self.lock.locked(),
+                'preview_available': self.active() and self.allowed_url(self.page.url), 'busy': self.lock.locked(),
+                'epoch': self.epoch, 'loading': self.loading,
+                'launch_mode': self.launch_mode, 'control_pending': self.agent_operation,
                 'inspection': {k: v for k, v in self.job.items() if k not in {'source', 'result'}} if self.job else None,
                 'document_id': self.document_id}
 
@@ -149,6 +174,7 @@ class LCWSession:
         target.chmod(0o600)
 
     async def attach(self, metadata):
+        self.launch_mode = metadata.get('mode', 'existing')
         # CDP stays loopback-only; neither endpoint nor cookies are exposed through the API.
         lines = (PROFILE_PATH / 'DevToolsActivePort').read_text().splitlines()
         if len(lines) != 2 or not lines[0].isdigit() or not 1 <= int(lines[0]) <= 65535 or not re.fullmatch(r'/devtools/browser/[\w-]+', lines[1]):
@@ -186,6 +212,7 @@ class LCWSession:
             self.save_metadata(metadata)
         self.page.set_default_timeout(8000)
         self.page.on('dialog', lambda dialog: dialog.dismiss())
+        await self.secure_page()
         # Additional tabs never become the agent target automatically.
 
     async def start(self, existing_only=False):
@@ -216,7 +243,7 @@ class LCWSession:
                     raise HTTPException(409, 'Existing browser ownership could not be verified. No replacement process was launched.') from None
                 else:
                     self.release_profile()
-                    raise HTTPException(409, 'A recorded browser process is still running but ownership could not be verified. Resolve the existing window before reopening.')
+                    raise HTTPException(409, 'A recorded browser process is still running but ownership could not be verified. Resolve the browser panel before reopening.')
             if not alive and ((PROFILE_PATH / 'SingletonLock').exists() or (PROFILE_PATH / 'SingletonLock').is_symlink()):
                 self.release_profile()
                 raise HTTPException(409, 'The dedicated LCW profile is locked by an existing browser. No new browser was launched.')
@@ -234,9 +261,11 @@ class LCWSession:
                     process = subprocess.Popen([
                         self.playwright.chromium.executable_path, f'--user-data-dir={PROFILE_PATH}',
                         '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0',
+                        '--headless=new', '--window-size=1280,800',
                         '--no-first-run', '--no-default-browser-check', 'about:blank',
                     ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-                    metadata = {'pid': process.pid}
+                    self.process = process
+                    metadata = {'pid': process.pid, 'mode': 'headless'}
                     self.save_metadata(metadata)
                     # Bounded condition wait for Chromium's own endpoint file; no portal sleeps.
                     deadline = time.monotonic() + 10
@@ -249,7 +278,7 @@ class LCWSession:
                 if not alive:
                     response = await self.page.goto(target, wait_until='domcontentloaded', timeout=20000)
                     if response and response.status >= 400:
-                        raise InspectionError('LCW failed to load. The existing window is preserved; check local network access.')
+                        raise InspectionError('LCW failed to load. The browser panel is preserved; check local network access.')
                 return await self.observe()
             except HTTPException:
                 await self.disconnect()
@@ -271,9 +300,9 @@ class LCWSession:
             self.state, self.message = 'idle', 'No active controlled browser. Inspection requires an existing authenticated session.'
             return self.result()
         location = origin(self.page.url)
-        if location == AUTH_ORIGIN:
+        if location in AUTH_ORIGINS:
             if await self.page.get_by_role('heading', name='Approve sign in request', exact=True).is_visible():
-                self.state, self.message = 'awaiting_mfa', 'MFA required. Complete it manually in the existing window only when ready.'
+                self.state, self.message = 'awaiting_mfa', 'MFA required. Complete it manually manually in the browser panel when ready.'
             else:
                 self.state, self.message = 'awaiting_authentication', 'Authentication required. No login will be attempted automatically.'
             self.owner = 'human'
@@ -292,7 +321,7 @@ class LCWSession:
             if not self.job:
                 self.message = 'Authenticated LCW session verified. Ready for read-only inspection.'
         else:
-            self.state, self.message = 'awaiting_authentication', 'LCW authentication could not be independently verified. Inspect the existing window; no login was attempted.'
+            self.state, self.message = 'awaiting_authentication', 'LCW authentication could not be independently verified. Inspect the browser panel; no login was attempted.'
             self.owner = 'human'
         return self.result()
 
@@ -303,56 +332,187 @@ class LCWSession:
                     await self.observe()
                 except PlaywrightError:
                     self.portal_authenticated = False
-                    self.state, self.message = 'failed', 'The browser page changed or closed. Inspect the existing window.'
+                    self.state, self.message = 'failed', 'The browser page changed or closed. Inspect the browser panel.'
         return self.result()
 
-    async def login(self):
-        async with self.lock:
-            await self.observe()
-            if self.authenticated():
-                return self.result()
-            if self.state == 'awaiting_mfa' or self.login_attempted:
-                raise HTTPException(409, 'A challenge or previous login attempt is pending. Use the existing window; credentials will not be resubmitted.')
-            if self.state != 'awaiting_authentication' or origin(self.page.url) != AUTH_ORIGIN:
-                raise HTTPException(409, 'Observed Microsoft sign-in is required. No login attempt was made.')
-            if not self.config.get('LCW_USERNAME') or not self.config.get('LCW_PASSWORD'):
-                raise HTTPException(503, 'Configured credentials are unavailable. Use the existing window manually.')
-            self.login_attempted = True
-            metadata = self.metadata()
-            metadata['login_attempted'] = True
-            self.save_metadata(metadata)
-            if await self.page.locator('#i0116').is_visible():
-                await self.page.locator('#i0116').fill(self.config['LCW_USERNAME'])
-                await self.page.get_by_role('button', name='Next', exact=True).click()
-                await self.page.locator('#i0118').wait_for(state='visible', timeout=8000)
-            if await self.page.locator('#i0118').is_visible():
-                self.password_attempted = True
-                await self.page.locator('#i0118').fill(self.config['LCW_PASSWORD'])
-                await self.page.get_by_role('button', name='Sign in', exact=True).click()
-            self.owner = 'human'
-            return await self.observe()
+    def allowed_url(self, url):
+        try:
+            parsed = urlsplit(url)
+            return (parsed.scheme == 'https' and not parsed.username and not parsed.password
+                    and origin(url) in {origin(self.config.get('LCW_URL', '')), *AUTH_ORIGINS})
+        except ValueError:
+            return False
 
-    async def frame(self):
-        async with self.frame_lock:
-            if not self.lock.locked():
-                async with self.lock:
-                    await self.observe()
-            if not self.authenticated():
-                self.last_frame = None
-                raise HTTPException(409, 'Preview paused until the existing session is authenticated.')
-            if self.last_frame and self.last_frame_url == self.page.url and time.monotonic() - self.last_frame_at < 1:
-                return self.last_frame
-            captured_url = self.page.url
-            image = await self.page.screenshot(type='jpeg', quality=65, timeout=4000,
-                                               mask=[self.page.locator('input[type="password"], #userProfileMenu')])
-            if not self.authenticated() or self.page.url != captured_url:
-                self.last_frame = None
-                raise HTTPException(409, 'The page navigated during capture; the frame was discarded.')
-            self.last_frame = image
-            self.last_frame_at = time.monotonic()
-            self.last_frame_url = captured_url
-            self.last_frame_captured = datetime.now(timezone.utc).isoformat()
-            return self.last_frame
+    async def secure_page(self):
+        # Guard page/frame navigations, including redirects and links. Assets may
+        # use the portal's CDNs. No wildcard identity-provider navigation grants.
+        async def guard(route):
+            request = route.request
+            if request.is_navigation_request() and not self.allowed_url(request.url):
+                self.owner = 'human'
+                self.epoch += 1
+                self.resume.clear()
+                self.message = 'Navigation blocked outside LCW and supported Microsoft sign-in pages.'
+                await route.abort()
+            else:
+                await route.fallback()
+        await self.context.route('**/*', guard)
+        async def popup(page):
+            if page != self.page:
+                await page.close()
+                self.message = 'A separate tab was blocked. Use same-page sign-in; native-only authentication requires operator review.'
+        self.context.on('page', popup)
+        def navigated(frame):
+            if frame == self.page.main_frame:
+                self.portal_authenticated = False
+                if origin(frame.url) != origin(self.config.get('LCW_URL', '')):
+                    self.owner = 'human'
+                    self.epoch += 1
+                    self.resume.clear()
+        self.page.on('framenavigated', navigated)
+        cdp = await self.context.new_cdp_session(self.page)
+        try:
+            await cdp.send('Network.setBypassServiceWorker', {'bypass': True})
+            await cdp.send('Page.setDownloadBehavior', {'behavior': 'deny'})
+        finally:
+            await cdp.detach()
+
+    async def login(self):
+        # Kept as a compatible lifecycle action, but credentials are never submitted.
+        await self.take_control()
+        self.message = 'Complete sign-in and MFA manually in the browser panel. No credentials were submitted.'
+        return self.result()
+
+    async def human_input(self, event, viewer):
+        async with self.lock:
+            if (self.viewer is not viewer or self.owner != 'human' or event.epoch != self.epoch
+                    or not self.active() or (not self.allowed_url(self.page.url) and event.type not in {'home', 'back', 'forward'})):
+                raise HTTPException(409, 'Input paused. Take control of the connected browser and retry.')
+            x, y = min(event.x * VIEW_WIDTH, VIEW_WIDTH - 1), min(event.y * VIEW_HEIGHT, VIEW_HEIGHT - 1)
+            if event.type == 'click':
+                await self.page.mouse.click(x, y)
+            elif event.type == 'wheel':
+                await self.page.mouse.move(x, y)
+                await self.page.mouse.wheel(event.delta_x, event.delta_y)
+            elif event.type == 'text':
+                await self.page.keyboard.insert_text(event.text)
+            elif event.type == 'key':
+                # Restrict shortcuts to editing/navigation; never browser/devtools shortcuts.
+                if (event.control or event.meta) and event.key not in {'a', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Backspace', 'Delete'}:
+                    raise HTTPException(422, 'Unsupported keyboard shortcut.')
+                prefix = ('Shift+' if event.shift else '') + ('Control+' if event.control else '') + ('Meta+' if event.meta else '')
+                await self.page.keyboard.press(prefix + event.key)
+            elif event.type == 'home':
+                await self.page.goto(self.config['LCW_URL'], wait_until='commit', timeout=10000)
+            elif event.type == 'reload':
+                await self.page.reload(wait_until='commit', timeout=10000)
+            else:
+                # Check history destination before asking Chromium to navigate.
+                cdp = await self.context.new_cdp_session(self.page)
+                try:
+                    history = await cdp.send('Page.getNavigationHistory')
+                    index = history['currentIndex'] + (-1 if event.type == 'back' else 1)
+                    if 0 <= index < len(history['entries']):
+                        entry = history['entries'][index]
+                        if self.allowed_url(entry['url']):
+                            await cdp.send('Page.navigateToHistoryEntry', {'entryId': entry['id']})
+                finally:
+                    await cdp.detach()
+
+    def viewer_ticket(self):
+        now = time.monotonic()
+        self.tickets = {key: expiry for key, expiry in self.tickets.items() if expiry > now}
+        if len(self.tickets) >= 8:
+            raise HTTPException(429, 'Too many pending viewer connections.')
+        ticket = secrets.token_urlsafe(32)
+        self.tickets[ticket] = now + 15
+        return ticket
+
+    async def stream(self, websocket):
+        # Only one viewer receives sensitive frames and can submit human input.
+        if self.viewer is not None:
+            await websocket.close(code=4409, reason='Another Command Center viewer is connected.')
+            return
+        lease = object()
+        self.viewer = lease
+        cdp = None
+        tasks = []
+        pending = asyncio.Queue(maxsize=1)
+        frame_ack = asyncio.Event()
+        frame_ack.set()
+        async def receive_frame(event):
+            # Keep at most the latest frame; no frame ever goes to disk or logs.
+            old = pending.get_nowait() if pending.full() else None
+            pending.put_nowait(event)
+            if old:
+                with suppress(PlaywrightError):
+                    await cdp.send('Page.screencastFrameAck', {'sessionId': old['sessionId']})
+        async def send_frames():
+            while self.active():
+                await websocket.send_json({'type': 'status', 'session': self.result()})
+                try:
+                    event = await asyncio.wait_for(pending.get(), 1)
+                except asyncio.TimeoutError:
+                    continue
+                if not self.active():
+                    return
+                if self.allowed_url(self.page.url):
+                    await asyncio.wait_for(frame_ack.wait(), 10)
+                    frame_ack.clear()
+                    await websocket.send_json({'type': 'frame', 'data': event['data']})
+                await cdp.send('Page.screencastFrameAck', {'sessionId': event['sessionId']})
+                await asyncio.sleep(0.05)  # Cap transport at 20 fps; Chromium emits on change.
+        async def receive_inputs():
+            while True:
+                raw = await asyncio.wait_for(websocket.receive_text(), 20)
+                if len(raw) > 12000:
+                    await websocket.close(code=1009)
+                    return
+                try:
+                    data = json.loads(raw)
+                    if data == {'type': 'ack'}:
+                        frame_ack.set()
+                        continue
+                    if data == {'type': 'ping'}:
+                        continue
+                    event = BrowserInput.model_validate(data)
+                    await asyncio.wait_for(self.human_input(event, lease), 15)
+                    await websocket.send_json({'type': 'input_ack'})
+                except (ValueError, ValidationError):
+                    await websocket.send_json({'type': 'input_error', 'message': 'Unsupported browser input.'})
+                except (HTTPException, PlaywrightError, asyncio.TimeoutError):
+                    await websocket.send_json({'type': 'input_error', 'message': 'Input paused or interrupted. Check control and browser status before retrying.'})
+        try:
+            if not self.active():
+                await websocket.close(code=4410, reason='Reconnect the existing browser first.')
+                return
+            async with self.lock:
+                cdp = await self.context.new_cdp_session(self.page)
+                await self.page.set_viewport_size({'width': VIEW_WIDTH, 'height': VIEW_HEIGHT})
+                cdp.on('Page.screencastFrame', receive_frame)
+                cdp.on('Page.frameStartedLoading', lambda _: setattr(self, 'loading', True))
+                cdp.on('Page.frameStoppedLoading', lambda _: setattr(self, 'loading', False))
+                await cdp.send('Page.enable')
+                await cdp.send('Page.startScreencast', {'format': 'jpeg', 'quality': 75, 'maxWidth': VIEW_WIDTH, 'maxHeight': VIEW_HEIGHT})
+            tasks = [asyncio.create_task(send_frames()), asyncio.create_task(receive_inputs())]
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        except (WebSocketDisconnect, PlaywrightError, OSError, RuntimeError, KeyError, asyncio.TimeoutError):
+            pass  # Never expose protocol errors, frame contents or input values.
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if cdp:
+                cdp.remove_listener('Page.screencastFrame', receive_frame)
+                with suppress(PlaywrightError):
+                    await cdp.send('Page.stopScreencast')
+                    await cdp.detach()
+            self.viewer = None
+            # Transport loss never launches, closes, logs in, or resumes automation.
+            with suppress(RuntimeError, WebSocketDisconnect):
+                await websocket.close()
 
     def progress(self, stage, state='inspecting'):
         self.job['state'], self.job['stage'] = state, stage
@@ -365,19 +525,23 @@ class LCWSession:
         if self.owner != 'agent' or epoch != self.epoch:
             raise Paused()
         async with self.lock:
-            if self.owner != 'agent' or epoch != self.epoch:
-                raise Paused()
-            await self.observe()
-            if not self.authenticated():
-                raise AuthenticationRequired()
-            if self.owner != 'agent' or epoch != self.epoch:
-                raise Paused()
-            self.progress(stage)
-            value = await asyncio.wait_for(operation(), timeout=12)
-            # Ownership may have changed while the single bounded operation awaited.
-            if self.owner != 'agent' or epoch != self.epoch:
-                raise Paused()
-            return value
+            self.agent_operation = True
+            try:
+                if self.owner != 'agent' or epoch != self.epoch:
+                    raise Paused()
+                await self.observe()
+                if not self.authenticated():
+                    raise AuthenticationRequired()
+                if self.owner != 'agent' or epoch != self.epoch:
+                    raise Paused()
+                self.progress(stage)
+                value = await asyncio.wait_for(operation(), timeout=12)
+                # Ownership may have changed while the single bounded operation awaited.
+                if self.owner != 'agent' or epoch != self.epoch:
+                    raise Paused()
+                return value
+            finally:
+                self.agent_operation = False
 
     async def begin(self, request):
         async with self.lock:
@@ -418,7 +582,7 @@ class LCWSession:
                     self.progress('Inspection paused for human control. Return control to reverify and restart the read-only inspection.', 'paused')
                     self.resume.clear()
             except AuthenticationRequired:
-                self.progress('Authentication is required in the existing window. Inspection paused; no login was attempted.', self.state)
+                self.progress('Authentication is required in the browser panel. Inspection paused; no login was attempted.', self.state)
                 self.owner = 'human'
                 self.resume.clear()
             except (PlaywrightTimeout, asyncio.TimeoutError):
@@ -429,7 +593,7 @@ class LCWSession:
                 self.progress(str(error), 'failed')
                 return
             except PlaywrightError:
-                self.progress('The browser changed, closed or failed during inspection. Check the existing window before retrying.', 'failed')
+                self.progress('The browser changed, closed or failed during inspection. Check the browser panel before retrying.', 'failed')
                 self.portal_authenticated = False
                 self.owner = 'human'
                 return
@@ -438,7 +602,7 @@ class LCWSession:
                 raise
             except Exception:
                 # Never leak raw HTML, URLs, identifiers or Playwright call logs via errors.
-                self.progress('The portal layout could not be safely inspected. Review the existing window before retrying.', 'failed')
+                self.progress('The portal layout could not be safely inspected. Review the browser panel before retrying.', 'failed')
                 return
 
     async def inspect_records(self, source, epoch):
@@ -545,9 +709,6 @@ class LCWSession:
         self.resume.clear()
         if self.job and self.task and not self.task.done():
             self.progress('Take Control requested. Pausing after the current bounded browser operation.', 'paused')
-        if not self.lock.locked() and self.active():
-            async with self.lock:
-                await self.page.bring_to_front()
         return self.result()
 
     async def return_control(self):
@@ -591,7 +752,6 @@ class LCWSession:
         finally:
             self.playwright = self.browser = self.context = self.page = None
             self.portal_authenticated = False
-            self.last_frame = None
             self.release_profile()
 
     async def shutdown(self):
@@ -614,7 +774,13 @@ class LCWSession:
                     await cdp.send('Browser.close')
                 except PlaywrightError:
                     if self.browser.is_connected():
-                        raise HTTPException(409, 'Browser close was not confirmed. The existing window and profile were retained.') from None
+                        raise HTTPException(409, 'Browser close was not confirmed. The browser panel and profile were retained.') from None
+            if self.process:
+                try:
+                    await asyncio.to_thread(self.process.wait, timeout=5)
+                except subprocess.TimeoutExpired:
+                    raise HTTPException(409, 'Browser is still exiting. The profile is retained; wait before reopening.') from None
+                self.process = None
             await self.shutdown()
             self.state, self.message = 'idle', 'Browser explicitly closed. The dedicated profile was retained; no logout was performed.'
             return self.result()
@@ -630,15 +796,35 @@ async def status(response: Response):
     return await session.status()
 
 
-@router.get('/frame')
-async def frame():
+@router.post('/viewer-ticket')
+async def viewer_ticket(response: Response):
+    response.headers['Cache-Control'] = 'no-store'
+    return {'ticket': session.viewer_ticket()}
+
+
+# WebSockets have their own mandatory Origin/Host/loopback guard (browsers cannot
+# add X-LCG-Local to a WebSocket). The one-use ticket arrives in the first message,
+# never a URL, cookie, access log or localStorage.
+viewer_router = APIRouter()
+
+
+@viewer_router.websocket('/api/browser/stream')
+async def browser_stream(websocket: WebSocket):
+    if (websocket.client is None or websocket.client.host not in {'127.0.0.1', '::1', 'testclient'}
+            or websocket.url.hostname not in {'localhost', '127.0.0.1', '::1', 'testserver'}
+            or websocket.headers.get('origin') not in LOCAL_ORIGINS):
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
     try:
-        image = await session.frame()
-        return Response(image, media_type='image/jpeg', headers={
-            'Cache-Control': 'no-store', 'X-LCG-Captured-At': session.last_frame_captured or '',
-        })
-    except PlaywrightError:
-        raise HTTPException(409, 'Preview interrupted by page navigation or closure. The existing session is preserved.') from None
+        ticket = await asyncio.wait_for(websocket.receive_text(), 5)
+        if len(ticket) > 100 or session.tickets.pop(ticket, 0) <= time.monotonic():
+            await websocket.close(code=4403)
+            return
+        await session.stream(websocket)
+    except (WebSocketDisconnect, KeyError, asyncio.TimeoutError):
+        with suppress(RuntimeError):
+            await websocket.close(code=4403)
 
 
 @router.get('/document')
@@ -662,7 +848,7 @@ async def navigation(response: Response):
     try:
         return await session.navigation()
     except PlaywrightError:
-        raise HTTPException(409, 'The page changed while reading navigation. Inspect the existing window.') from None
+        raise HTTPException(409, 'The page changed while reading navigation. Inspect the browser panel.') from None
 
 
 @router.post('/inspect', status_code=202)
@@ -699,7 +885,7 @@ async def perform(action):
         return await session.status()
     except PlaywrightTimeout:
         session.owner = 'human'
-        raise HTTPException(504, 'The page timed out. Inspect the existing window before explicitly retrying.') from None
+        raise HTTPException(504, 'The page timed out. Inspect the browser panel before explicitly retrying.') from None
     except PlaywrightError:
         session.owner = 'human'
         session.portal_authenticated = False

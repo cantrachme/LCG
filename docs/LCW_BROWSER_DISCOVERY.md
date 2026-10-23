@@ -116,3 +116,30 @@ Screenshots come from the exact controlled page, remain in memory and are return
 Use one existing backend worker without reload: `.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log`. Start the existing frontend normally. Reconnect an existing owned browser when available; do not initiate login/MFA merely to complete a test.
 
 References: [Playwright CDP attachment](https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp), [authentication state sensitivity](https://playwright.dev/python/docs/auth), [Microsoft session lifetime](https://learn.microsoft.com/en-us/entra/identity/conditional-access/concept-session-lifetime).
+
+## Step 1 — Interactive embedded browser (2026-10-23)
+
+This section supersedes the screenshot-only implementation above. The React panel now receives CDP screencast frames over one authenticated local WebSocket and sends a finite set of mouse, wheel, text, keyboard and history actions to the exact page used by inspection. Frames stay in memory; there is no screenshot polling endpoint, iframe, second portal browser, arbitrary JavaScript/CDP endpoint, or frame recording. Rendering is capped at 20 fps with acknowledgements and a one-frame pending queue. The fixed 1280×800 viewport scales with the panel and expanded view.
+
+Human input and agent inspection share the backend operation lock. Take Control invalidates the agent epoch immediately; input waits until the current bounded operation finishes. Return Control re-observes authentication and restarts inspection with identity verification. A viewer lease prevents simultaneous viewer connections; stale ownership epochs reject queued input. Loopback, Host, Origin, the existing local HTTP header and short-lived single-use viewer tickets restrict access. Tickets travel in the initial socket message, not URLs or storage. Payload validation errors are sanitized. Frames, input values, tickets and protocol errors are not logged or persisted by the application.
+
+New launches use headless Chromium and the unchanged fixed `.lcw-browser-profile` path. Existing owners are attached without being closed or relaunched. Profile locks and process ownership checks remain in force. Explicit close waits for an owned child process to exit; shutdown only detaches. The legacy login action now hands control to the operator and never submits configured credentials. Microsoft authentication and MFA remain manual. Navigation is limited to the configured HTTPS LCW origin and exact supported Microsoft origins; popups and downloads are blocked. A restricted LCW home button recovers from blocked-navigation error pages.
+
+### Controlled migration
+
+Reconnect first. An existing headed browser remains headed and is not forcibly closed. When the operator is ready, stop inspection, select **Close browser explicitly**, wait for closure, then **Open embedded browser**. The same profile is retained and the next launch is headless. Never delete locks, copy/migrate the profile, launch a second process against it, or retry MFA to validate this change. If ownership cannot be verified, resolve the existing owner before reopening.
+
+### Verification and limitations
+
+- 76 offline backend tests pass, including PDF extraction, inspection orchestration and comparison regressions, input validation/scaling, ownership boundaries, navigation restrictions, ticket access, duplicate ownership, and streaming cleanup.
+- The opt-in real Chromium acceptance test passes against the actual React app at localhost:5173 with a separate isolated test backend. Verified streamed image decoding; clicks; typing; Tab, Enter and Backspace; wheel scrolling; panel resizing; expanded view; back/forward/reload; frontend refresh; socket disconnection/recovery; human/agent handoff on the exact same page; synthetic MFA visibility; blocked-navigation recovery; backend detach/reattach; duplicate-owner prevention; and synthetic cookie/local-storage retention after explicit close/reopen.
+- Synthetic tests use named reusable profiles under `/tmp/lcg-step1-tests`, never the LCW profile or `.env`. Portal and Microsoft fixture requests are fulfilled locally. Test browser processes are explicitly closed. No real LCW authentication or MFA was initiated.
+- Frontend lint, TypeScript checks and production build pass. Existing PyMuPDF SWIG deprecation warnings remain.
+- Real LCW session persistence and Microsoft policy compatibility are **not verified**. At initial inspection, the managed profile directory was absent and no process owned that path; unrelated existing Chromium windows were untouched. Synthetic persistence does not prove existing LCW authentication will survive headless migration.
+- Native OS authentication dialogs, security-key prompts, separate-window flows, downloads, drag selection and full IME composition are not implemented. Unsupported identity-provider origins remain blocked rather than bypassing Microsoft policy. Only one Command Center viewer can connect at a time.
+
+Run offline checks from `backend`: `../.venv/bin/python -m pytest tests -q`.
+With the frontend already running, opt into the isolated live test: `LCG_BROWSER_TEST=1 ../.venv/bin/python -m pytest tests/test_browser_live.py -q`.
+Run frontend checks from `frontend`: `npm run lint`, `npx tsc -b --pretty false`, `npm run build`.
+Run one backend worker without reload: `.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 --no-access-log --ws-max-size 16384`.
+No dependencies or environment files were added. No work on Steps 2–5 was performed.

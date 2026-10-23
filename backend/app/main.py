@@ -6,7 +6,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import database
+from . import database, llm
 from .contracts import MAX_FILE_BYTES, ContractExtraction, ExtractionError, extract_contract
 from .browser import local_request, router as browser_router, viewer_router, session
 
@@ -26,6 +26,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await llm.shutdown()
         await session.shutdown()
         database.dispose()
 
@@ -38,6 +39,7 @@ app = FastAPI(
 
 app.include_router(browser_router)
 app.include_router(viewer_router)
+app.include_router(llm.router)
 app.include_router(database.persistence_router(local_request))
 
 app.add_middleware(

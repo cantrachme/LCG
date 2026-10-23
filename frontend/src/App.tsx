@@ -42,6 +42,17 @@ function displayValue(value: FieldValue): string {
 }
 
 type Conversation = { id: string; title: string; created_at: string }
+type ModelConfig = { endpoint: string; model: string; configured: boolean }
+type Execution = { name?: string; state: string; stage?: string; message?: string; verified?: boolean; result?: unknown; kind?: string; workflow?: unknown; workflow_id?: string }
+function execution(message: Message): Execution | null {
+  if (!['ai_turn', 'tool'].includes(message.role)) return null
+  try { return JSON.parse(message.content) } catch { return { state: 'unreadable', message: 'Execution details unavailable.' } }
+}
+function mergeMessages(previous: Message[], incoming: Message[]) {
+  const byId = new Map(previous.map(message => [message.id, message]))
+  incoming.forEach(message => byId.set(message.id, message))
+  return [...byId.values()]
+}
 type Message = { id: string; role: string; content: string; created_at: string }
 type DocumentRecord = { id: string; conversation_id: string; extraction: ContractExtraction; metadata: { filename: string }; created_at: string }
 const api = 'http://127.0.0.1:8000/api'
@@ -86,6 +97,8 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [loaded, setLoaded] = useState(false)
   const [busy, setBusy] = useState('')
+  const [modelConfig, setModelConfig] = useState<ModelConfig | null>(null)
+  const [authorization, setAuthorization] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [revision, setRevision] = useState(0)
   const [renaming, setRenaming] = useState(false)
@@ -96,6 +109,32 @@ function App() {
   const end = useRef<HTMLDivElement | null>(null)
   const current = conversations.find(chat => chat.id === active)
   const draft = active ? drafts[active] ?? '' : ''
+  const consentScope = JSON.stringify([active, modelConfig?.endpoint, modelConfig?.model])
+  const authorized = !!modelConfig?.configured && authorization === consentScope
+  const aiRunning = messages.some(message => ['queued', 'running'].includes(execution(message)?.state ?? '') && message.role === 'ai_turn')
+  const lastUser = [...messages].filter(message => message.role === 'user').sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id)).at(-1)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void request<ModelConfig>('/ai/config', { signal: controller.signal }).then(setModelConfig)
+      .catch(() => { if (!controller.signal.aborted) setModelConfig(null) })
+    return () => controller.abort()
+  }, [revision])
+
+  useEffect(() => {
+    if (!active) return
+    const controller = new AbortController()
+    let timer: number
+    async function poll() {
+      try {
+        const saved = await all<Message>(`/persistence/conversations/${active}/messages`, controller.signal)
+        if (!controller.signal.aborted) setMessages(previous => mergeMessages(previous, saved))
+      } catch (cause) { if (!controller.signal.aborted) setError(failure(cause)) }
+      finally { if (!controller.signal.aborted) timer = window.setTimeout(poll, document.hidden ? 5000 : 1500) }
+    }
+    timer = window.setTimeout(poll, 1500)
+    return () => { controller.abort(); window.clearTimeout(timer) }
+  }, [active])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -142,7 +181,7 @@ function App() {
   }
   function switchChat(id: string) {
     if (mutation.current) return
-    setError(null); setActive(id)
+    setError(null); setAuthorization(null); setActive(id)
   }
   function newChat() {
     void mutate('Creating chat…', async () => {
@@ -167,22 +206,35 @@ function App() {
       setDrafts(previous => { const next = { ...previous }; delete next[active]; return next })
     })
   }
+  async function askAI(chatId: string, messageId: string, documentId: string | null) {
+    if (!authorized || !modelConfig) throw new Error('Authorize data sharing with the configured model before requesting an AI response.')
+    const turn = await request<Message>(`/ai/conversations/${chatId}/respond`, { method: 'POST', body: JSON.stringify({
+      user_message_id: messageId, document_id: documentId, authorize_data_transfer: true,
+      authorized_endpoint: modelConfig.endpoint, authorized_model: modelConfig.model,
+    }) })
+    setMessages(previous => mergeMessages(previous, [turn]))
+  }
   function submit(event: FormEvent) {
     event.preventDefault()
-    if (!active || !loaded || (!draft.trim() && !file)) return
+    if (!active || !loaded || aiRunning || (!draft.trim() && !file)) return
     const chatId = active
     void mutate(file ? 'Saving and extracting PDF…' : 'Saving message…', async () => {
+      let userMessage: Message | null = null
+      let documentId = extraction?.extraction_id ?? null
       if (draft.trim()) {
         const message = await request<Message>(`/persistence/conversations/${chatId}/messages`, { method: 'POST', body: JSON.stringify({ role: 'user', content: draft.trim() }) })
-        setMessages(previous => [...previous, message]); setDrafts(previous => ({ ...previous, [chatId]: '' }))
+        userMessage = message
+        setMessages(previous => mergeMessages(previous, [message])); setDrafts(previous => ({ ...previous, [chatId]: '' }))
       }
       if (file) {
         const body = new FormData(); body.append('file', file)
         const saved = await request<ContractExtraction>(`/contracts/extract?conversation_id=${chatId}`, { method: 'POST', body })
         setFile(null); if (fileInput.current) fileInput.current.value = ''
         setExtraction(saved)
+        documentId = saved.extraction_id
         setDocuments(await all<DocumentRecord>(`/persistence/conversations/${chatId}/documents`))
       }
+      if (userMessage && authorized) await askAI(chatId, userMessage.id, documentId)
     })
   }
   const timeline = [
@@ -208,7 +260,7 @@ function App() {
             <header className="chat-header"><h2>{current?.title ?? 'Start a conversation'}</h2>
               <div className="chat-tools">
                 <button className="connection-button" disabled={!current || !!busy || loading} onClick={() => { setTitle(current!.title); setRenaming(!renaming); setDeleting(false) }}>Rename</button>
-                <button className="connection-button" disabled={!current || !!busy || loading} onClick={() => { setDeleting(!deleting); setRenaming(false) }}>Delete</button>
+                <button className="connection-button" disabled={!current || !!busy || loading || aiRunning} onClick={() => { setDeleting(!deleting); setRenaming(false) }}>Delete</button>
                 <button className="connection-button" disabled={!!busy || loadingHistory || loading} onClick={() => { setError(null); setRevision(value => value + 1) }}>Refresh chats</button>
               </div>
             </header>
@@ -217,9 +269,14 @@ function App() {
             {error && <p className="upload-error chat-error" role="alert">{error}</p>}
             <div className="chat-transcript" aria-label="Messages and attachments" aria-busy={loading}>
               {loading ? <p className="chat-placeholder" role="status">Loading conversation…</p> : <>
-                {!timeline.length && <div className="chat-placeholder"><h3>{active ? 'What would you like to work on?' : 'A place for your work.'}</h3><p>{active ? 'Save a message or attach a contract PDF.' : 'Create a new chat to save messages and contract details.'}</p><p>AI replies are not connected yet.</p></div>}
+                {!timeline.length && <div className="chat-placeholder"><h3>{active ? 'What would you like to work on?' : 'A place for your work.'}</h3><p>{active ? 'Save a message or attach a contract PDF.' : 'Create a new chat to save messages and contract details.'}</p><p>Ask about your contract or request a read-only LCW inspection. AI requires model setup and your data-sharing authorization.</p></div>}
                 {timeline.map(item => item.kind === 'message' ? <article key={item.value.id} className={`chat-message ${item.value.role === 'user' ? 'from-user' : ''}`}>
-                  <header><strong>{item.value.role === 'user' ? 'You' : fieldLabel(item.value.role)}</strong><time dateTime={item.value.created_at}>{timestamp(item.value.created_at)}</time></header><p>{item.value.content}</p>
+                  <header><strong>{item.value.role === 'user' ? 'You' : item.value.role === 'ai_turn' ? 'AI execution' : item.value.role === 'tool' ? 'LCW tool' : 'AI Coworker'}</strong><time dateTime={item.value.created_at}>{timestamp(item.value.created_at)}</time></header>
+                  {execution(item.value) ? <div role="status"><p>{execution(item.value)?.name && `${fieldLabel(execution(item.value)!.name!)} · `}{fieldLabel(execution(item.value)!.state)}</p>
+                    <p>{execution(item.value)?.stage ?? execution(item.value)?.message}</p>
+                    {item.value.role === 'tool' && <small>{execution(item.value)?.verified ? (execution(item.value)?.kind === 'status_only' ? 'Status observed; records were not inspected.' : 'Read-only inspection completed. Review differences and unverified fields below.') : 'No verified completion.'}</small>}
+                    {item.value.role === 'tool' && <details><summary>Execution details</summary><pre className="tool-result">{JSON.stringify(execution(item.value), null, 2)}</pre></details>}
+                  </div> : <p>{item.value.content}</p>}
                 </article> : <article className="chat-attachment" key={item.value.id}>
                   <header><strong>▤ {item.value.metadata.filename}</strong><time dateTime={item.value.created_at}>{timestamp(item.value.created_at)}</time></header>
                   <p>{item.value.extraction.page_count} page(s) · Extracted information saved</p>
@@ -235,18 +292,24 @@ function App() {
               <div ref={end} />
             </div>
             <form className="composer chat-composer" onSubmit={submit} aria-busy={!!busy}>
+              <div className="ai-consent">
+                {modelConfig?.configured ? <><label><input type="checkbox" checked={authorized} disabled={!active || !!busy || aiRunning} onChange={event => setAuthorization(event.target.checked ? consentScope : null)} />
+                  I authorize sending this chat’s history, selected/latest PDF details, and LCW inspection results—including child/family information—to {modelConfig.endpoint} using {modelConfig.model} for AI processing.</label>
+                  <button type="button" className="connection-button" disabled={!authorized || !lastUser || !!busy || aiRunning || !loaded} onClick={() => void mutate('Requesting AI…', () => askAI(active!, lastUser!.id, extraction?.extraction_id ?? null))}>Ask AI about last message</button></>
+                  : <p>AI unavailable: configure the model endpoint, model and API key on the backend. Messages can still be saved.</p>}
+              </div>
               <label htmlFor="chat-message">Message</label>
-              <div className="composer-input"><textarea id="chat-message" rows={3} maxLength={20000} placeholder="Write a message…" disabled={!active || !loaded || !!busy || loadingHistory}
+              <div className="composer-input"><textarea id="chat-message" rows={3} maxLength={20000} placeholder="Write a message…" disabled={!active || !loaded || !!busy || loadingHistory || aiRunning}
                 value={draft} onChange={event => { if (active) setDrafts(previous => ({ ...previous, [active]: event.target.value })) }}
                 onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); event.currentTarget.form?.requestSubmit() } }} />
-                <button className="send-button" aria-label="Send message or upload PDF" disabled={!active || !loaded || !!busy || loadingHistory || (!draft.trim() && !file)}>↑</button></div>
+                <button className="send-button" aria-label="Send message or upload PDF" disabled={!active || !loaded || !!busy || loadingHistory || aiRunning || (!draft.trim() && !file)}>↑</button></div>
               <div className="chat-upload"><label className="connection-button" htmlFor="chat-pdf">Attach PDF</label><input ref={fileInput} id="chat-pdf" type="file" accept=".pdf,application/pdf" disabled={!active || !loaded || !!busy} onChange={event => {
                 const selected = event.target.files?.[0] ?? null
                 setError(null); setFile(null)
                 if (selected && (!selected.name.toLowerCase().endsWith('.pdf') || selected.size === 0 || selected.size > 5 * 1024 * 1024)) { setError('Choose a non-empty PDF up to 5 MB.'); event.target.value = ''; return }
                 setFile(selected)
               }} />{file && <><span>{file.name}</span><button type="button" className="connection-button" disabled={!!busy} onClick={() => { setFile(null); if (fileInput.current) fileInput.current.value = '' }}>Remove</button></>}</div>
-              <p role="status">{busy || 'Messages and extracted details are saved. Original PDF files are not retained.'}</p>
+              <p role="status">{busy || (aiRunning ? 'AI is working. Verified tool progress appears above; refreshing does not start another turn.' : authorized ? 'Send to AI · LCW tools are read-only. No automatic login or MFA.' : 'Save locally · AI data sharing is off. Original PDF files are not retained.')}</p>
             </form>
           </div>
         </section>

@@ -80,6 +80,7 @@ def initialize():
         runs = tables['workflow_runs']
         connection.execute(runs.update().where(runs.c.state.in_(['inspecting', 'running', 'queued'])).values(
             state='paused', updated_at=datetime.now(timezone.utc)))
+    recover_ai_turns()
 
 
 def dispose():
@@ -286,3 +287,65 @@ def listing(name, limit, offset, foreign_key=None, identifier=None):
             row(c, t['conversations'], identifier)
             query = query.where(table.c[foreign_key] == str(identifier))
         return [dict(r) for r in c.execute(query.order_by(table.c.created_at, table.c.id).limit(limit).offset(offset)).mappings()]
+
+
+def ai_context(conversation_id, message_id, document_id=None):
+    """Bounded context from one conversation only; never browser configuration."""
+    with transaction() as (c, t):
+        row(c, t['conversations'], conversation_id)
+        message = row(c, t['messages'], message_id)
+        if str(message['conversation_id']) != str(conversation_id) or message['role'] != 'user':
+            raise HTTPException(422, 'Choose a user message from this conversation.')
+        history = list(c.execute(t['messages'].select().where(t['messages'].c.conversation_id == str(conversation_id))
+            .order_by(t['messages'].c.created_at.desc(), t['messages'].c.id.desc()).limit(100)).mappings())[::-1]
+        users = [m for m in history if m['role'] == 'user']
+        if not users or str(users[-1]['id']) != str(message_id):
+            raise HTTPException(409, 'Only the latest user message can start an AI turn.')
+        if document_id:
+            document = row(c, t['documents'], document_id)
+            if str(document['conversation_id']) != str(conversation_id):
+                raise HTTPException(422, 'Document does not belong to this conversation.')
+        else:
+            document = c.execute(t['documents'].select().where(t['documents'].c.conversation_id == str(conversation_id))
+                .order_by(t['documents'].c.created_at.desc(), t['documents'].c.id.desc()).limit(1)).mappings().first()
+        return [dict(m) for m in history], dict(document) if document else None
+
+
+def add_ai_message(conversation_id, role, content, identifier=None):
+    with transaction() as (c, t):
+        row(c, t['conversations'], conversation_id)
+        identifier = identifier or str(uuid4())
+        c.execute(t['messages'].insert().values(id=identifier, conversation_id=str(conversation_id), role=role, content=content))
+        return row(c, t['messages'], identifier)
+
+
+def reserve_ai_turn(conversation_id, message_id, provider, model):
+    import json
+    from uuid import uuid5, NAMESPACE_URL
+    identifier = str(uuid5(NAMESPACE_URL, 'lcg-ai-turn:' + str(message_id)))
+    with transaction() as (c, t):
+        # Serialize across API requests/workers; duplicate requests never replay tools.
+        c.execute(t['conversations'].select().where(t['conversations'].c.id == str(conversation_id)).with_for_update()).first()
+        row(c, t['conversations'], conversation_id)
+        existing = c.execute(t['messages'].select().where(t['messages'].c.id == identifier)).mappings().first()
+        if existing:
+            return dict(existing), False
+        turns = c.execute(t['messages'].select().where(
+            (t['messages'].c.conversation_id == str(conversation_id)) & (t['messages'].c.role == 'ai_turn'))).mappings()
+        if any(json.loads(turn['content'])['state'] in {'queued', 'running'} for turn in turns):
+            raise HTTPException(409, 'An AI turn is already active in this conversation.')
+        content = json.dumps({'state': 'queued', 'user_message_id': str(message_id),
+                              'provider': provider, 'model': model, 'authorized_data_transfer': True})
+        c.execute(t['messages'].insert().values(id=identifier, conversation_id=str(conversation_id), role='ai_turn', content=content))
+        return row(c, t['messages'], identifier), True
+
+
+def recover_ai_turns():
+    import json
+    with transaction() as (c, t):
+        messages = t['messages']
+        for saved in c.execute(messages.select().where(messages.c.role.in_(['ai_turn', 'tool']))).mappings():
+            data = json.loads(saved['content'])
+            if data.get('state') in {'queued', 'running'}:
+                data.update(state='interrupted', message='Backend restarted. This execution was not resumed automatically.', verified=False)
+                c.execute(messages.update().where(messages.c.id == saved['id']).values(content=json.dumps(data)))

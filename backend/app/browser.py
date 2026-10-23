@@ -555,18 +555,19 @@ class LCWSession:
             finally:
                 self.agent_operation = False
 
-    async def begin(self, request):
+    async def begin(self, request, source=None):
         async with self.lock:
             if self.task and not self.task.done():
-                if self.job['extraction_id'] == request.extraction_id:
+                if source is None and self.job['extraction_id'] == request.extraction_id:
                     return self.result()
                 raise HTTPException(409, 'An inspection is already active. Take control or wait before inspecting a different document.')
             if self.job and self.job['request_id'] == request.request_id:
                 return self.result()
-            if not self.document or request.extraction_id != self.document_id:
+            source = source or self.document
+            if not source or request.extraction_id != source.extraction_id:
                 raise HTTPException(409, 'The uploaded extraction is unavailable or changed. Upload/review the PDF before inspecting.')
             try:
-                expected_identity(self.document)
+                expected_identity(source)
             except InspectionError as error:
                 raise HTTPException(422, str(error)) from None
             await self.observe()
@@ -574,9 +575,10 @@ class LCWSession:
                 raise HTTPException(409, 'No authenticated controlled LCW session is available. Inspection did not start and no login was attempted.')
             if self.owner != 'agent':
                 raise HTTPException(409, 'Human control is active. Return control to the agent before inspection.')
-            self.job = {'id': str(uuid4()), 'request_id': request.request_id, 'extraction_id': self.document_id,
+            self.set_document(source)
+            self.job = {'id': str(uuid4()), 'request_id': request.request_id, 'extraction_id': source.extraction_id,
                         'state': 'inspecting', 'stage': 'Inspection requested', 'version': 0, 'events': [],
-                        'source': self.document.model_copy(deep=True), 'result': None}
+                        'source': source.model_copy(deep=True), 'result': None}
             if database.configured():
                 try:
                     database.save_workflow(self.job)

@@ -274,3 +274,9 @@ main { max-width: 1600px; margin: 0 auto; padding: 34px 40px 20px; }
   .chat-history nav { display: flex; gap: 6px; overflow-x: auto; }
   .history-item { min-width: 120px; max-width: 180px; }
 }
+
+.ai-consent { font-size: 10px; color: #586879; margin-bottom: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.ai-consent label { font-size: 10px; font-weight: 400; }
+.ai-consent input { vertical-align: middle; margin-right: 6px; }
+.ai-consent button { margin-top: 6px; font-size: 10px; }
+.tool-result { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 240px; overflow: auto; font-size: 10px; }
